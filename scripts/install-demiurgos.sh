@@ -1,0 +1,788 @@
+#!/usr/bin/env bash
+# Demiurgos POSIX installer core (S3a — design S3-1..S3-7, tasks 4.1-4.12).
+#
+# Provisions a runnable Demiurgos on Linux/macOS with NO pre-installed
+# Python/Node/compiler, NO admin rights and NO source clone:
+#
+#   1. floors preflight      macOS >= 13 on Apple Silicon (arm64) ONLY,
+#                            glibc >= 2.28, free disk, Windows
+#                            LongPathsEnabled parity note (S3b owns it);
+#                            Intel macOS and musl/Alpine fail fast with the
+#                            documented manual-install alternative (decision
+#                            #3579, supersedes #3565)
+#   2. version resolve       DEMIURGOS_VERSION else `latest`
+#   3. download+verify       SHA256SUMS + SHA256SUMS.minisig, then the
+#                            platform payload from DEMIURGOS_URL_BASE (https://
+#                            or file:// for hermetic harnesses); the manifest
+#                            SIGNATURE is verified BEFORE the checksums (S5b);
+#                            version.json is only the legacy-name fallback
+#   4. uv provisioning       pinned UV_VERSION, verified against the channel's
+#                            signed uv-shas.env (DEMIURGOS_UV_SHA256 override for
+#                            tests), codesign --verify --deep --strict on macOS
+#                            (M2)
+#   5. runtime               UV_PYTHON_INSTALL_DIR uv python install 3.12,
+#                            uv venv --python 3.12 <stage>/.venv,
+#                            uv pip install --require-hashes
+#                            --only-binary=:all: -r requirements.lock
+#                            (mandatory; optional extras best-effort)
+#   6. atomic staging        <install_root>/.staging/<version>-<rand> on the
+#                            SAME filesystem -> mv -> app/<version> ->
+#                            flip `current` symlink; failure leaves NO
+#                            runnable state
+#   7. data root             explicit `--data-root PATH` (recorded in the
+#                            pointer) or, without it, bootstrap-once the
+#                            default <documents>/Demiurgos + .env seed; the
+#                            DEMIURGOS_DATA_ROOT override never writes the
+#                            pointer but always seeds .env (S0-A, step 4)
+#
+# The core NEVER runs a package manager other than the verified uv, NEVER
+# executes files from the payload (only the launcher the user starts runs),
+# and NEVER requires elevation.
+#
+# Env contract (frozen layout, docs/architecture/INSTALL_LAYOUT.md):
+#   DEMIURGOS_URL_BASE   channel base (REQUIRED; https:// or file://)
+#   DEMIURGOS_VERSION    pin; default `latest`
+#   DEMIURGOS_HOME       install root; default ~/.demiurgos
+#   DEMIURGOS_DATA_ROOT  data root override for this install (wins); it does
+#                        NOT write the pointer and says so. Use --data-root for
+#                        a choice that must survive the install.
+#   --data-root PATH     install-time choice of the content folder: recorded in
+#                        the pointer, folders and .env created there. A relative
+#                        path is normalized against the cwd. The installer never
+#                        prompts; an unknown argument fails with usage.
+#   DEMIURGOS_UV_SHA256  expected uv archive sha256 (single-target test seam;
+#                        a normal install reads the signed uv-shas.env)
+#   DEMIURGOS_HERMES_SKIP  "1" -> skip the assistant runtime provisioning
+#                        (hermetic installer harnesses; never a normal install).
+#                        The script is downloaded and verified against the
+#                        signed SHA256SUMS before it runs.
+#   UV_VERSION           pinned uv version
+#   DEMIURGOS_LANGUAGE   seeded data-root locale (default es)
+#   DEMIURGOS_WORLD      optional seeded world
+#   DEMIURGOS_SEED_ONLY  "1" -> seed-only entry point: run ONLY the
+#                        data-root bootstrap-once + .env seed (design S3-7)
+#                        and exit 0. No download, no uv, no staging, no
+#                        DEMIURGOS_URL_BASE required. Resolution order is the
+#                        installer's own (DEMIURGOS_DATA_ROOT env -> existing
+#                        pointer -> bootstrap-once). Idempotent: an existing
+#                        pointer and .env are preserved byte-for-byte. The
+#                        gated-write regression harness
+#                        (test_install_auth_gated_write.py) invokes this mode
+#                        to exercise the REAL shipping seed path.
+#   DEMIURGOS_FAKE_OS / DEMIURGOS_FAKE_ARCH / DEMIURGOS_FAKE_LIBC /
+#   DEMIURGOS_FAKE_MACOS_VERSION / DEMIURGOS_FAKE_GLIBC_VERSION
+#                        detection TEST SEAMS (same pattern as
+#                        DEMIURGOS_UV_SHA256): default to real detection;
+#                        hermetic harnesses simulate supported/unsupported
+#                        platforms without editing this script at runtime.
+#
+# Decision #3579 NARROWS the declared matrix (supersedes #3565's widening):
+# the .docx importer must be uniform (present) on every supported system, so
+# Intel macOS, macOS below the floor, musl/Alpine and glibc < 2.28 are NOT
+# supported and fail fast in check_floors with the documented manual-install
+# alternative. The closure proof (D3) confirms the exact minimum macOS
+# version; the mandatory/optional split stays as a safety net.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verify_checksum.sh
+source "$SCRIPT_DIR/lib/verify_checksum.sh"
+
+# Work dirs created under the staging root (same filesystem, never a temp dir
+# on another FS). Cleaned on exit so a failed install leaves no debris and no
+# runnable state; the committed app/<version> is never touched.
+WORK_DIRS=""
+# Verified channel manifest (SHA256SUMS); reused by the runtime provisioner so
+# the Hermes script is verified against the SAME signed manifest as the core.
+SUMS_FILE=""
+
+cleanup() {
+    local d
+    for d in $WORK_DIRS; do
+        rm -rf "$d"
+    done
+    if [ -n "${STAGE_DIR:-}" ]; then
+        rm -rf "$STAGE_DIR"
+    fi
+}
+trap cleanup EXIT
+
+# --- defaults -------------------------------------------------------------
+URL_BASE="${DEMIURGOS_URL_BASE:-}"
+INSTALL_ROOT="${DEMIURGOS_HOME:-$HOME/.demiurgos}"
+VERSION="${DEMIURGOS_VERSION:-latest}"
+UV_VERSION="${UV_VERSION:-0.5.24}"
+uv="$INSTALL_ROOT/bin/uv"
+UV_PYTHON_INSTALL_DIR="$INSTALL_ROOT/python"
+VENV_PYTHON_REL=".venv/bin/python"
+STAGING_ROOT="$INSTALL_ROOT/.staging"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/demiurgos"
+POINTER_FILE="$CONFIG_DIR/data-root.json"
+# Single documented macOS floor (decision #3579). The closure proof (D3)
+# confirms the exact minimum macOS version for the wheels-only mandatory
+# closure; check_floors enforces exactly this constant and the fail message
+# names it verbatim.
+MACOS_MIN_MAJOR=13
+GLIBC_MIN="2.28"
+MIN_FREE_KB=2097152   # 2 GiB
+# Detection with test seams (see the env contract above): DEMIURGOS_FAKE_*
+# default to the real values; hermetic harnesses override them to simulate
+# platforms without editing this script at runtime.
+OS="${DEMIURGOS_FAKE_OS:-$(uname -s)}"
+ARCH="${DEMIURGOS_FAKE_ARCH:-$(uname -m)}"
+LIBC="glibc"
+
+fail() {
+    printf 'install-demiurgos: error: %s\n' "$1" >&2
+    exit 1
+}
+
+warn() {
+    printf 'install-demiurgos: warning: %s\n' "$1" >&2
+}
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: install-demiurgos.sh [--data-root PATH]
+
+  --data-root PATH   where the author's content lives (worlds, ideas,
+                     templates). The path is recorded in the data-root pointer,
+                     so every later start finds it. Defaults to
+                     <documents>/Demiurgos.
+
+The installer never asks questions: the flag is the install-time choice, and the
+app offers the same folder on first run.
+USAGE
+}
+
+# --- Install-time choice (step 4, S1-S3) ------------------------------------
+# `--data-root` is the explicit choice and it PERSISTS: it writes the pointer,
+# so a later start without any environment variable still finds the content.
+# `DEMIURGOS_DATA_ROOT` keeps its run-time meaning (S4): it wins for this
+# install and leaves the pointer alone, but the output says so out loud.
+DATA_ROOT_CHOICE=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --data-root)
+            [ "$#" -ge 2 ] || fail "--data-root needs a path"
+            [ -n "$2" ] || fail "--data-root needs a non-empty path"
+            DATA_ROOT_CHOICE="$2"
+            shift 2
+            ;;
+        --data-root=*)
+            DATA_ROOT_CHOICE="${1#--data-root=}"
+            [ -n "$DATA_ROOT_CHOICE" ] || fail "--data-root needs a non-empty path"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            usage
+            fail "unknown argument: $1"
+            ;;
+    esac
+done
+if [ -n "$DATA_ROOT_CHOICE" ]; then
+    case "$DATA_ROOT_CHOICE" in
+        /*) ;;
+        *) DATA_ROOT_CHOICE="$PWD/$DATA_ROOT_CHOICE" ;;
+    esac
+fi
+
+# --- OS / arch / libc ------------------------------------------------------
+
+uv_arch() {
+    case "$ARCH" in
+        x86_64|amd64) printf 'x86_64' ;;
+        aarch64|arm64) printf 'aarch64' ;;
+        *) fail "unsupported architecture: $ARCH" ;;
+    esac
+}
+
+detect_libc() {
+    if [ "${DEMIURGOS_FAKE_LIBC:-}" = "musl" ] || [ -f /etc/alpine-release ]; then
+        LIBC="musl"
+    elif command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
+        LIBC="musl"
+    fi
+}
+
+uv_target() {
+    local a
+    a="$(uv_arch)"
+    case "$OS" in
+        Linux)
+            if [ "$LIBC" = "musl" ]; then
+                printf '%s-unknown-linux-musl\n' "$a"
+            else
+                printf '%s-unknown-linux-gnu\n' "$a"
+            fi
+            ;;
+        Darwin)
+            printf '%s-apple-darwin\n' "$a"
+            ;;
+        *)
+            fail "unsupported OS: $OS (this core covers Linux and macOS; Windows is S3b)"
+            ;;
+    esac
+}
+
+payload_cell() {
+    # Package-cell name used by the channel artifacts (S2 release pipeline). It
+    # is NOT a mechanical transform of uv_target: the release matrix publishes
+    # `macos-arm64` while the uv triple says `aarch64`, and a mismatch would
+    # silently install the Linux payload (or fail with no matching entry).
+    case "$OS" in
+        Linux) printf 'linux-%s\n' "$(uv_arch)" ;;
+        Darwin)
+            case "$(uv_arch)" in
+                aarch64) printf 'macos-arm64\n' ;;
+                *) fail "unsupported macOS architecture: $(uv_arch) (Demiurgos requires Apple Silicon)" ;;
+            esac
+            ;;
+        *) fail "unsupported OS: $OS (this core covers Linux and macOS; Windows is S3b)" ;;
+    esac
+}
+
+# --- floors preflight (4.4) ------------------------------------------------
+
+version_ge() {  # a b  -> a >= b as dotted numbers
+    local a="$1" b="$2" a_major a_minor b_major b_minor
+    a_major="${a%%.*}"; a_minor="${a#*.}"
+    b_major="${b%%.*}"; b_minor="${b#*.}"
+    [ "$a_major" -gt "$b_major" ] && return 0
+    [ "$a_major" -lt "$b_major" ] && return 1
+    [ "${a_minor:-0}" -ge "${b_minor:-0}" ]
+}
+
+check_floors() {
+    case "$OS" in
+        Darwin)
+            # Decision #3579: Apple Silicon (arm64) ONLY — Intel macOS fails
+            # fast with the documented manual-install alternative.
+            if [ "$(uv_arch)" = "x86_64" ]; then
+                fail "Intel Macs are not supported: Demiurgos requires macOS on Apple Silicon (arm64). Manual install alternative: run Demiurgos from source on this machine — see the installation guide"
+            fi
+            local sw major
+            sw="${DEMIURGOS_FAKE_MACOS_VERSION:-$(sw_vers -productVersion 2>/dev/null || true)}"
+            major="${sw%%.*}"
+            if [ -z "$major" ] || [ "$major" -lt "$MACOS_MIN_MAJOR" ]; then
+                fail "macOS $MACOS_MIN_MAJOR or newer is required (found ${sw:-unknown}); upgrade macOS and re-run — or use the manual install alternative from the installation guide"
+            fi
+            ;;
+        Linux)
+            # Decision #3579: musl/Alpine is NOT supported — fail fast with the
+            # documented manual-install alternative; never attempt a wheels-only
+            # install that cannot satisfy the closure.
+            if [ "$LIBC" = "musl" ]; then
+                fail "musl/Alpine is not supported: the wheels-only install cannot satisfy the dependency closure on musl. Manual install alternative: use a glibc-based Linux distribution, or run Demiurgos from source — see the installation guide"
+            fi
+            local glibc_ver
+            glibc_ver="${DEMIURGOS_FAKE_GLIBC_VERSION:-$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}' || true)}"
+            if [ -z "$glibc_ver" ] || ! version_ge "$glibc_ver" "$GLIBC_MIN"; then
+                fail "glibc $GLIBC_MIN or newer is required (found ${glibc_ver:-unknown}); upgrade the OS and re-run — or use the manual install alternative from the installation guide"
+            fi
+            ;;
+        *)
+            fail "unsupported OS: $OS (this core covers Linux and macOS; Windows is S3b)"
+            ;;
+    esac
+    local free_kb
+    free_kb="$(df -Pk "$INSTALL_ROOT" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+    if [ -z "$free_kb" ] || [ "$free_kb" -lt "$MIN_FREE_KB" ]; then
+        fail "at least 2 GiB of free disk space is required at $INSTALL_ROOT (found ${free_kb:-unknown} KiB); free space and re-run"
+    fi
+    printf '%s\n' "install-demiurgos: note: the Windows floor (LongPathsEnabled) is enforced by the S3b Windows core (parity note)"
+}
+
+# --- download helpers (https + file:// test seam) ---------------------------
+
+download() {  # url dest
+    case "$1" in
+        file://*) cp "${1#file://}" "$2" ;;
+        https://*) curl --proto '=https' --tlsv1.2 --retry 3 --max-time 120 -fsSL -o "$2" "$1" ;;
+        *) fail "unsupported URL scheme in $1 (use https:// or file://)" ;;
+    esac
+}
+
+download_stdout() {  # url  -> stdout
+    case "$1" in
+        file://*) cat "${1#file://}" ;;
+        https://*) curl --proto '=https' --tlsv1.2 --retry 3 --max-time 120 -fsSL "$1" ;;
+        *) fail "unsupported URL scheme in $1 (use https:// or file://)" ;;
+    esac
+}
+
+json_str() {  # file key  -> first "key": "value"
+    sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | sed -n '1p'
+}
+
+sha_for() {  # sums_file name -> first sha256 for name
+    awk -v name="$2" '$2==name {print $1; exit}' "$1"
+}
+
+# --- version resolve + release download (4.3) -------------------------------
+
+resolve_version() {
+    if [ "$VERSION" = "latest" ]; then
+        VERSION="$(download_stdout "$URL_BASE/latest" 2>/dev/null | tr -d '[:space:]' | sed -n '1p' || true)"
+        if [ -z "$VERSION" ]; then
+            # A channel with no stable release yet (beta-first): resolve the
+            # beta pointer explicitly and SAY SO, instead of failing a default
+            # install against a pointer that does not exist.
+            VERSION="$(download_stdout "$URL_BASE/latest-beta" 2>/dev/null | tr -d '[:space:]' | sed -n '1p' || true)"
+            [ -n "$VERSION" ] \
+                && printf 'install-demiurgos: note: no stable pointer yet; installing from the beta pointer %s\n' "$VERSION" >&2
+        fi
+    fi
+    [ -n "$VERSION" ] || fail "could not resolve a version from $URL_BASE/latest (and no latest-beta fallback); set DEMIURGOS_VERSION explicitly and re-run"
+    printf 'install-demiurgos: resolved version %s\n' "$VERSION" >&2
+}
+
+fetch_and_verify_payload() {
+    local workdir version_json payload_name expected
+    workdir="$STAGING_ROOT/.work-$VERSION-$$"
+    WORK_DIRS="$WORK_DIRS $workdir"
+    mkdir -p "$workdir"
+    download "$URL_BASE/SHA256SUMS" "$workdir/SHA256SUMS" \
+        || fail "cannot download SHA256SUMS from $URL_BASE; check the channel and re-run"
+    # Signature file (S5b / task 8.4): the channel manifest MUST be signed,
+    # and the signature is verified BEFORE any checksum is trusted and BEFORE
+    # anything from the channel is executed. Fail-closed when the signature
+    # file is missing or does not verify against the embedded MINISIGN_PUBKEY.
+    download "$URL_BASE/SHA256SUMS.minisig" "$workdir/SHA256SUMS.minisig" 2>/dev/null || true
+    verify_minisig "$workdir/SHA256SUMS" "$workdir/SHA256SUMS.minisig" \
+        || fail "the channel manifest signature is INVALID or missing; refusing to trust the channel — fix the channel and re-run"
+    SUMS_FILE="$workdir/SHA256SUMS"
+
+    # Platform-correct payload: the channel publishes one archive per package
+    # cell (linux-x86_64, linux-aarch64, macos-arm64). An Apple Silicon mac must
+    # never receive the Linux archive. Older channels (and the hermetic
+    # fixtures) publish a single flat name, so fall back to version.json's
+    # `posix` pointer and then to the legacy flat name.
+    payload_name="demiurgos-app-$VERSION-$(payload_cell).tar.gz"
+    expected="$(sha_for "$SUMS_FILE" "$payload_name")"
+    if [ -z "$expected" ]; then
+        payload_name=""
+        version_json="$workdir/version.json"
+        if download "$URL_BASE/version.json" "$version_json" 2>/dev/null; then
+            payload_name="$(json_str "$version_json" posix)"
+        fi
+        [ -n "$payload_name" ] || payload_name="demiurgos-app-$VERSION.tar.gz"
+        expected="$(sha_for "$SUMS_FILE" "$payload_name")"
+    fi
+    [ -n "$expected" ] \
+        || fail "no checksum entry for an installable payload in SHA256SUMS; fix the channel and re-run"
+    PAYLOAD_FILE="$workdir/$payload_name"
+    download "$URL_BASE/$payload_name" "$PAYLOAD_FILE" \
+        || fail "cannot download $payload_name from $URL_BASE; check the channel and re-run"
+    verify_sha256 "$PAYLOAD_FILE" "$expected" \
+        || fail "checksum mismatch for $payload_name; the download is corrupt or tampered — fix the channel and re-run"
+}
+
+# --- product-owned Hermes runtime (S5/S7, hermes-core-runtime T3) ----------
+# The runtime is provisioned by scripts/provision-hermes.sh, downloaded from
+# the SAME signed channel manifest as this core and verified BEFORE execution
+# (download-then-verify-then-execute). A missing script or checksum entry is a
+# channel defect: fail closed instead of shipping an assistant-less install.
+
+fetch_channel_manifest() {
+    local workdir
+    if [ -n "${SUMS_FILE:-}" ] && [ -f "$SUMS_FILE" ]; then
+        return 0
+    fi
+    workdir="$STAGING_ROOT/.work-manifest-$$"
+    WORK_DIRS="$WORK_DIRS $workdir"
+    mkdir -p "$workdir"
+    download "$URL_BASE/SHA256SUMS" "$workdir/SHA256SUMS" \
+        || fail "cannot download SHA256SUMS from $URL_BASE; check the channel and re-run"
+    download "$URL_BASE/SHA256SUMS.minisig" "$workdir/SHA256SUMS.minisig" 2>/dev/null || true
+    verify_minisig "$workdir/SHA256SUMS" "$workdir/SHA256SUMS.minisig" \
+        || fail "the channel manifest signature is INVALID or missing; refusing to trust the channel — fix the channel and re-run"
+    SUMS_FILE="$workdir/SHA256SUMS"
+}
+
+provision_hermes_runtime() {
+    local workdir script expected
+    if [ "${DEMIURGOS_HERMES_SKIP:-0}" = "1" ]; then
+        printf 'install-demiurgos: Hermes runtime provisioning skipped (DEMIURGOS_HERMES_SKIP=1)\n' >&2
+        return 0
+    fi
+    fetch_channel_manifest
+    workdir="$STAGING_ROOT/.work-provision-$$"
+    WORK_DIRS="$WORK_DIRS $workdir"
+    mkdir -p "$workdir"
+    script="$workdir/provision-hermes.sh"
+    download "$URL_BASE/scripts/provision-hermes.sh" "$script" \
+        || fail "cannot download scripts/provision-hermes.sh from $URL_BASE; the assistant runtime cannot be provisioned — fix the channel and re-run"
+    expected="$(sha_for "$SUMS_FILE" "scripts/provision-hermes.sh")"
+    [ -n "$expected" ] \
+        || fail "SHA256SUMS has no entry for scripts/provision-hermes.sh; fix the channel and re-run"
+    verify_sha256 "$script" "$expected" \
+        || fail "checksum mismatch for scripts/provision-hermes.sh; the download is corrupt or tampered — fix the channel and re-run"
+    bash "$script" --install-root "$INSTALL_ROOT" \
+        || fail "Hermes runtime provisioning failed; the assistant is required by default — see the error above and re-run"
+}
+
+# --- uv provisioning (4.5/4.6, M2) ------------------------------------------
+
+# Load the channel's uv checksum table into UV_SHA_* variables.
+#
+# The publish job derives one uv-shas.env from the exact uv archives it ships
+# and lists it in the signed SHA256SUMS, so the table itself is verified before
+# any value is trusted. Only whitelisted keys with a 64-hex value are accepted:
+# an env file is data, never shell code, so it is parsed line by line instead of
+# being sourced. DEMIURGOS_UV_SHA256 stays the single-target test seam and wins
+# outright.
+load_uv_checksums() {
+    [ -n "${DEMIURGOS_UV_SHA256:-}" ] && return 0
+    local workdir file expected line key value
+    fetch_channel_manifest
+    workdir="$STAGING_ROOT/.work-uvshas-$$"
+    WORK_DIRS="$WORK_DIRS $workdir"
+    mkdir -p "$workdir"
+    file="$workdir/uv-shas.env"
+    download "$URL_BASE/uv-shas.env" "$file" \
+        || fail "cannot download uv-shas.env from $URL_BASE; the channel is incomplete — fix the channel and re-run"
+    expected="$(sha_for "$SUMS_FILE" "uv-shas.env")"
+    [ -n "$expected" ] \
+        || fail "SHA256SUMS has no entry for uv-shas.env; fix the channel and re-run"
+    verify_sha256 "$file" "$expected" \
+        || fail "checksum mismatch for uv-shas.env; the download is corrupt or tampered — fix the channel and re-run"
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ''|'#'*) continue ;;
+        esac
+        key="${line%%=*}"
+        value="${line#*=}"
+        case "$key" in
+            UV_SHA_X86_64_LINUX_GNU|UV_SHA_AARCH64_LINUX_GNU|\
+            UV_SHA_X86_64_LINUX_MUSL|UV_SHA_AARCH64_LINUX_MUSL|\
+            UV_SHA_X86_64_DARWIN|UV_SHA_AARCH64_DARWIN|\
+            UV_SHA_X86_64_WINDOWS_MSVC) ;;
+            *) continue ;;
+        esac
+        case "$value" in
+            *[!0-9a-f]*) fail "uv-shas.env has a malformed sha256 for $key; fix the channel and re-run" ;;
+        esac
+        [ "${#value}" -eq 64 ] \
+            || fail "uv-shas.env has a malformed sha256 for $key; fix the channel and re-run"
+        export "$key=$value"
+    done < "$file"
+}
+
+uv_expected_sha256() {
+    if [ -n "${DEMIURGOS_UV_SHA256:-}" ]; then
+        printf '%s\n' "$DEMIURGOS_UV_SHA256"
+        return 0
+    fi
+    # Filled by load_uv_checksums from the channel's signed uv-shas.env. An
+    # empty table with no override -> refuse to install an unverified toolchain.
+    local t
+    t="$(uv_target)"
+    case "$t" in
+        x86_64-unknown-linux-gnu) printf '%s\n' "${UV_SHA_X86_64_LINUX_GNU:-}" ;;
+        aarch64-unknown-linux-gnu) printf '%s\n' "${UV_SHA_AARCH64_LINUX_GNU:-}" ;;
+        x86_64-unknown-linux-musl) printf '%s\n' "${UV_SHA_X86_64_LINUX_MUSL:-}" ;;
+        aarch64-unknown-linux-musl) printf '%s\n' "${UV_SHA_AARCH64_LINUX_MUSL:-}" ;;
+        x86_64-apple-darwin) printf '%s\n' "${UV_SHA_X86_64_DARWIN:-}" ;;
+        aarch64-apple-darwin) printf '%s\n' "${UV_SHA_AARCH64_DARWIN:-}" ;;
+        *) fail "unsupported uv target: $t" ;;
+    esac
+}
+
+provision_uv() {
+    local target expected url workdir uvfile
+    target="$(uv_target)"
+    load_uv_checksums
+    expected="$(uv_expected_sha256)"
+    [ -n "$expected" ] || fail "no uv checksum available for $target; the channel's uv-shas.env has no entry for it — fix the channel and re-run"
+    url="$URL_BASE/uv/uv-$target-$UV_VERSION.tar.gz"
+    workdir="$STAGING_ROOT/.uv-$VERSION-$$"
+    WORK_DIRS="$WORK_DIRS $workdir"
+    mkdir -p "$workdir"
+    UV_ARCHIVE="$workdir/uv.tar.gz"
+    download "$url" "$UV_ARCHIVE" \
+        || fail "cannot download $url (uv provider unreachable); no runnable state was left — re-run when the provider is reachable"
+    verify_sha256 "$UV_ARCHIVE" "$expected" \
+        || fail "checksum mismatch for the uv archive $url; refusing to install an unverified toolchain — fix the channel and re-run"
+    tar -xzf "$UV_ARCHIVE" -C "$workdir" || fail "cannot extract the uv archive; it may be corrupt — re-run"
+    uvfile="$(find "$workdir" -maxdepth 2 -type f -name uv | sed -n '1p')"
+    [ -n "$uvfile" ] || fail "the uv archive contains no uv binary; fix the channel and re-run"
+    mkdir -p "$INSTALL_ROOT/bin"
+    cp "$uvfile" "$uv"
+    chmod +x "$uv"
+    if [ "$OS" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
+        codesign --verify --deep --strict "$uv" || fail "codesign verification failed for $uv (Gatekeeper/quarantine); see the docs"
+    fi
+    printf 'install-demiurgos: uv %s installed at %s\n' "$UV_VERSION" "$uv" >&2
+}
+
+# --- stage, venv, install (4.6/4.7/4.8) --------------------------------------
+
+find_req_file() {  # name -> first match under the staged tree
+    local name="$1"
+    for cand in "$STAGE_DIR/$name" "$STAGE_DIR/src/tools/demiurgos-suite/$name"; do
+        if [ -f "$cand" ]; then
+            printf '%s\n' "$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
+stage_and_install() {
+    local req opt
+    STAGE_DIR="$STAGING_ROOT/$VERSION-$RANDOM"
+    mkdir -p "$STAGE_DIR"
+    tar -xzf "$PAYLOAD_FILE" -C "$STAGE_DIR" \
+        || { rm -rf "$STAGE_DIR"; fail "cannot extract the payload; it may be corrupt — re-run"; }
+
+    UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" "$uv" python install 3.12 \
+        || { rm -rf "$STAGE_DIR"; fail "uv python install failed (uv unreachable or broken); no runnable state was left — re-run"; }
+    UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" "$uv" venv --python 3.12 "$STAGE_DIR/.venv" \
+        || { rm -rf "$STAGE_DIR"; fail "uv venv creation failed; no runnable state was left — re-run"; }
+
+    req="$(find_req_file requirements.lock || true)"
+    [ -n "$req" ] || req="$(find_req_file requirements.txt || true)"
+    [ -n "$req" ] || { rm -rf "$STAGE_DIR"; fail "no hash-locked requirements file (requirements.lock) in the payload; refusing a non-locked install — fix the channel and re-run"; }
+
+    if ! "$uv" pip install --python "$STAGE_DIR/.venv/bin/python" --require-hashes --only-binary=:all: -r "$req"; then
+        rm -rf "$STAGE_DIR"
+        fail "the mandatory wheel-only install failed; aborting with no runnable half-install — see the error above and re-run"
+    fi
+
+    opt="$(find_req_file requirements-optional.txt || true)"
+    if [ -n "$opt" ]; then
+        "$uv" pip install --python "$STAGE_DIR/.venv/bin/python" --only-binary=:all: -r "$opt" \
+            || warn "optional extras failed to install; the app runs with degraded optional features (document conversion / live watching unavailable)"
+    else
+        warn "no requirements-optional.txt in the payload; optional extras are skipped"
+    fi
+}
+
+commit_staging() {
+    mkdir -p "$INSTALL_ROOT/app"
+    mv "$STAGE_DIR" "$INSTALL_ROOT/app/$VERSION" \
+        || { rm -rf "$STAGE_DIR"; fail "cannot move the staged app into app/$VERSION (staging is on the same filesystem); re-run"; }
+    STAGE_DIR=""
+    ln -sfn "app/$VERSION" "$INSTALL_ROOT/current" \
+        || fail "cannot flip current -> app/$VERSION; the previous version (if any) is untouched"
+    printf 'install-demiurgos: installed %s at %s/current\n' "$VERSION" "$INSTALL_ROOT" >&2
+}
+
+write_channel_config() {
+    # Persist the channel base URL this install validated (https:// or
+    # file:// — `download` fails on any other scheme) so the runtime updater
+    # resolves it WITHOUT the env override (design S2-b). Written next to
+    # commit_staging because it records the channel this install trusts.
+    printf '{\n  "schema_version": 1,\n  "url_base": "%s"\n}\n' "$URL_BASE" > "$INSTALL_ROOT/channel.json"
+    printf 'install-demiurgos: persisted channel config at %s/channel.json\n' "$INSTALL_ROOT" >&2
+}
+
+# --- Linux applications-menu entry -----------------------------------------
+# The menu entry is standard installer behavior; the visible Desktop icon is
+# NOT written here. It stays opt-in (`start-demiurgos.sh install --desktop`):
+# a copied-down .desktop shows up as an "Untrusted application launcher" on
+# GNOME/Nautilus until it is marked metadata::trusted, so creating it behind
+# the user's back looks broken instead of helpful.
+#
+# The template is read as DATA from the installed app and substituted here.
+# The installer never executes payload files (threat-matrix "documentation-like
+# paths"), so it may not delegate to `start-demiurgos.sh install`; the
+# placeholder and the destination rule stay byte-identical to the launcher's
+# install_desktop — one product, two writers.
+DESKTOP_TEMPLATE_REL="desktop/Demiurgos.desktop"
+
+applications_dir() {
+    printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+}
+
+install_desktop_entry() {
+    local app_root="$INSTALL_ROOT/current" template menu_dir
+    [ "$OS" = "Linux" ] || return 0
+    template="$app_root/$DESKTOP_TEMPLATE_REL"
+    if [ ! -f "$template" ]; then
+        warn "no $DESKTOP_TEMPLATE_REL in the payload; the applications menu entry is skipped"
+        return 0
+    fi
+    menu_dir="$(applications_dir)"
+    mkdir -p "$menu_dir" 2>/dev/null \
+        || { warn "cannot create $menu_dir; the applications menu entry is skipped"; return 0; }
+    sed "s|@PROJECT_ROOT@|$app_root|g" "$template" > "$menu_dir/Demiurgos.desktop" 2>/dev/null \
+        || { warn "cannot write the applications menu entry; skipped"; return 0; }
+    chmod 0644 "$menu_dir/Demiurgos.desktop" 2>/dev/null || true
+    printf 'install-demiurgos: applications menu entry at %s/Demiurgos.desktop\n' "$menu_dir" >&2
+}
+
+# --- data-root bootstrap-once + .env seed (4.9, S0-A) ------------------------
+
+seed_env_file() {
+    local env_file locale
+    ENV_FILE="$DATA_ROOT/.env"
+    if [ ! -f "$ENV_FILE" ]; then
+        locale="${DEMIURGOS_LANGUAGE:-es}"
+        {
+            printf 'DEMIURGOS_AUTH_MODE=local-dev\n'
+            printf 'DEMIURGOS_LANGUAGE=%s\n' "$locale"
+            # A released install must know where a report goes, or no report can
+            # reach the triage group (S18). Overridable for a private relay.
+            printf 'DEMIURGOS_BUGREPORT_RELAY_URL=%s\n' \
+                "${DEMIURGOS_BUGREPORT_RELAY_URL:-https://demiurgos-bugreport-relay.demiurgos.workers.dev}"
+            # The bot handle builds the https://t.me deep link behind the QR.
+            printf 'DEMIURGOS_BUGREPORT_BOT_USERNAME=%s\n' \
+                "${DEMIURGOS_BUGREPORT_BOT_USERNAME:-ReportesDemiurgosBot}"
+            if [ -n "${DEMIURGOS_WORLD:-}" ]; then
+                printf 'DEMIURGOS_WORLD=%s\n' "$DEMIURGOS_WORLD"
+            fi
+        } > "$ENV_FILE"
+        printf 'install-demiurgos: seeded %s (DEMIURGOS_AUTH_MODE=local-dev)\n' "$ENV_FILE" >&2
+    fi
+}
+
+# Default content root (step 3): the OS documents folder, resolved through the
+# freedesktop contract and never hardcoded. A localized desktop keeps it in
+# ~/Documentos (or ~/Documenti, ...), so a literal ~/Documents would create a
+# second, English folder next to the one the user sees. Pure shell: no
+# xdg-user-dir binary and no Python. Prints the folder only.
+documents_dir() {
+    local user_dirs="${XDG_CONFIG_HOME:-$HOME/.config}/user-dirs.dirs" raw=""
+    if [ -r "$user_dirs" ]; then
+        raw="$(sed -n 's/^[[:space:]]*XDG_DOCUMENTS_DIR[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$user_dirs" 2>/dev/null | sed -n '1p')"
+    fi
+    case "$raw" in
+        '') printf '%s\n' "$HOME/Documents" ;;
+        '$HOME') printf '%s\n' "$HOME" ;;
+        '$HOME/'*) printf '%s\n' "$HOME/${raw#\$HOME/}" ;;
+        '${HOME}') printf '%s\n' "$HOME" ;;
+        '${HOME}/'*) printf '%s\n' "$HOME/${raw#\$\{HOME\}/}" ;;
+        *) printf '%s\n' "$raw" ;;
+    esac
+}
+
+read_pointer_value() {
+    [ -r "$POINTER_FILE" ] || return 0
+    sed -n 's/.*"data_root"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$POINTER_FILE" | sed -n '1p'
+}
+
+# Byte-compatible with data_root.py (schema_version 1, indent 2, trailing
+# newline) so Python's read_pointer reads it back. The path is JSON-escaped: a
+# folder can validly contain a quote (POSIX) or a backslash (a POSIX path
+# with one, or a mounted Windows tree), and raw printf would write a record that
+# read_pointer rejects — or, worse, silently reads back a different path.
+write_pointer_record() {
+    local escaped
+    mkdir -p "$CONFIG_DIR"
+    escaped="$(printf '%s' "$DATA_ROOT" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+    printf '{\n  "schema_version": 1,\n  "data_root": "%s",\n  "updated_at": "%s"\n}\n' \
+        "$escaped" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$POINTER_FILE"
+}
+
+ensure_content_dirs() {
+    mkdir -p "$DATA_ROOT" "$DATA_ROOT/mundos" "$DATA_ROOT/ideas" \
+        "$DATA_ROOT/data" "$DATA_ROOT/config"
+}
+
+bootstrap_data_root() {
+    local pointed=""
+
+    # 1. Explicit install-time choice: it persists.
+    if [ -n "$DATA_ROOT_CHOICE" ]; then
+        DATA_ROOT="$DATA_ROOT_CHOICE"
+        ensure_content_dirs
+        pointed="$(read_pointer_value)"
+        if [ -n "$pointed" ] && [ "$pointed" != "$DATA_ROOT" ]; then
+            printf 'install-demiurgos: reorienting the data root on explicit request: %s -> %s\n' \
+                "$pointed" "$DATA_ROOT" >&2
+        fi
+        write_pointer_record
+        printf 'install-demiurgos: the author content lives in %s\n' "$DATA_ROOT" >&2
+        printf 'install-demiurgos: recorded in %s; change it with --data-root or from the app\n' \
+            "$POINTER_FILE" >&2
+        seed_env_file
+        return 0
+    fi
+
+    # 2. Environment override for this install only: never touches the pointer.
+    if [ -n "${DEMIURGOS_DATA_ROOT:-}" ]; then
+        DATA_ROOT="$DEMIURGOS_DATA_ROOT"
+        ensure_content_dirs
+        printf 'install-demiurgos: using DEMIURGOS_DATA_ROOT=%s (override; the choice is NOT recorded)\n' \
+            "$DATA_ROOT" >&2
+        printf 'install-demiurgos: pass --data-root to record %s for every later start\n' \
+            "$DATA_ROOT" >&2
+        seed_env_file
+        return 0
+    fi
+
+    # 3. An existing pointer is preserved byte-for-byte.
+    if [ -r "$POINTER_FILE" ]; then
+        pointed="$(read_pointer_value)"
+        if [ -n "$pointed" ]; then
+            DATA_ROOT="$pointed"
+            printf 'install-demiurgos: preserving existing data-root pointer -> %s\n' "$DATA_ROOT" >&2
+            return 0
+        fi
+        fail "data-root pointer $POINTER_FILE is unreadable; refusing to guess"
+    fi
+
+    # 4. Bootstrap-once the default <documents>/Demiurgos.
+    DATA_ROOT="$(documents_dir)/Demiurgos"
+    ensure_content_dirs
+    write_pointer_record
+    printf 'install-demiurgos: the author content lives in %s\n' "$DATA_ROOT" >&2
+    printf 'install-demiurgos: change it with --data-root or from the app\n' >&2
+    seed_env_file
+}
+
+# --- seed-only entry point (S0-A; test/ops seam) -----------------------------
+# DEMIURGOS_SEED_ONLY=1 performs ONLY the data-root bootstrap-once + .env seed
+# (design S3-7) and exits 0 — the exact code path the full install runs at the
+# end (bootstrap_data_root), so the gated-write regression harness
+# (test_install_auth_gated_write.py) exercises the REAL shipping seed against a
+# tmp HOME/XDG_CONFIG_HOME/DEMIURGOS_HOME. Never downloads, never touches uv,
+# never requires DEMIURGOS_URL_BASE. Idempotence is preserved: an existing
+# pointer and an existing .env are left byte-for-byte untouched.
+if [ "${DEMIURGOS_SEED_ONLY:-0}" = "1" ]; then
+    bootstrap_data_root
+    printf 'install-demiurgos: seed-only done; data root is %s\n' "$DATA_ROOT" >&2
+    exit 0
+fi
+
+# --- main --------------------------------------------------------------------
+
+[ -n "$URL_BASE" ] || fail "DEMIURGOS_URL_BASE is not set; it is required (https:// or file:// channel base)"
+
+detect_libc
+mkdir -p "$INSTALL_ROOT"
+check_floors
+resolve_version
+
+# Idempotent re-run: same version already current -> exit 0, nothing to do.
+if [ -L "$INSTALL_ROOT/current" ] && [ "$(readlink "$INSTALL_ROOT/current")" = "app/$VERSION" ] && [ -d "$INSTALL_ROOT/app/$VERSION" ]; then
+    printf 'install-demiurgos: %s is already installed and current; nothing to do\n' "$VERSION" >&2
+    # ...except the applications-menu entry and the assistant runtime, which
+    # are the installer's own to own: a user who deleted the entry, or an
+    # earlier install that predates the runtime, is repaired by re-running the
+    # installer without reinstalling the app. Provisioning is idempotent.
+    install_desktop_entry
+    mkdir -p "$STAGING_ROOT"
+    provision_hermes_runtime
+    exit 0
+fi
+
+mkdir -p "$STAGING_ROOT"
+fetch_and_verify_payload
+provision_uv
+stage_and_install
+commit_staging
+write_channel_config
+provision_hermes_runtime
+bootstrap_data_root
+install_desktop_entry
+
+printf '%s\n' "install-demiurgos: done. Start Demiurgos with:"
+printf '%s\n' "  $INSTALL_ROOT/current/scripts/start-demiurgos.sh start"

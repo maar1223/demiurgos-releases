@@ -1,0 +1,753 @@
+# ---------------------------------------------------------------------------
+# Demiurgos Windows installer core (S3b - design S3-1..S3-7 parity, tasks
+# 5.1-5.5). Windows PowerShell 5.1.
+#
+# Parity implementation of scripts/install-demiurgos.sh. Provisions a runnable
+# Demiurgos under %LOCALAPPDATA%\Demiurgos with NO pre-installed
+# Python/Node/compiler, NO admin rights and NO source clone:
+#
+#   1. floors preflight      Windows 10/11 x86_64 ONLY (decision #3579),
+#                            LongPathsEnabled, free disk; unsupported
+#                            Windows/arch fail fast with the documented
+#                            manual-install alternative
+#   2. version resolve       DEMIURGOS_VERSION else `latest`
+#   3. download+verify       version.json, SHA256SUMS (+ .minisig when
+#                            present), payload from DEMIURGOS_URL_BASE
+#                            (https:// or file:// for hermetic harnesses)
+#   4. uv provisioning       pinned UV_VERSION, verified against the channel's
+#                            signed uv-shas.env (DEMIURGOS_UV_SHA256 override for
+#                            tests)
+#   5. runtime               UV_PYTHON_INSTALL_DIR uv python install 3.12,
+#                            uv venv --python 3.12 <stage>\.venv,
+#                            uv pip install --require-hashes
+#                            --only-binary=:all: -r requirements.lock
+#                            (mandatory; optional extras best-effort)
+#   6. atomic staging        <install_root>\.staging\<version>-<rand> on the
+#                            SAME filesystem -> Move-Item -> app\<version> ->
+#                            flip `current` JUNCTION (S0-C); failure leaves NO
+#                            runnable state
+#   7. data root             explicit -DataRoot PATH (recorded in the
+#                            pointer) or, without it, bootstrap-once the
+#                            default <documents>\Demiurgos + .env seed; the
+#                            DEMIURGOS_DATA_ROOT override never writes the
+#                            pointer but always seeds .env (S0-A, step 4)
+#
+# The core NEVER runs a package manager other than the verified uv, NEVER
+# executes files from the payload (only the launcher the user starts runs),
+# and NEVER requests elevation.
+#
+# ASCII-only on purpose: Windows PowerShell 5.1 mis-decodes BOM-less UTF-8.
+#
+# Env contract (frozen layout, docs/architecture/INSTALL_LAYOUT.md):
+#   DEMIURGOS_URL_BASE   channel base (REQUIRED; https:// or file://)
+#   DEMIURGOS_VERSION    pin; default `latest`
+#   DEMIURGOS_HOME       install root; default %LOCALAPPDATA%\Demiurgos
+#   DEMIURGOS_DATA_ROOT  data root override for this install (wins); it does
+#                        NOT write the pointer and says so. Use -DataRoot for a
+#                        choice that must survive the install.
+#   -DataRoot PATH       install-time choice of the content folder: recorded in
+#                        the pointer, folders and .env created there. A relative
+#                        path is normalized. The installer never prompts.
+#   DEMIURGOS_UV_SHA256  expected uv archive sha256 (single-target test seam;
+#                        a normal install reads the signed uv-shas.env)
+#   DEMIURGOS_HERMES_SKIP  "1" -> skip the assistant runtime provisioning
+#                        (hermetic installer harnesses; never a normal install).
+#                        scripts/provision-hermes.ps1 is downloaded and
+#                        verified against the signed SHA256SUMS before it runs.
+#   UV_VERSION           pinned uv version
+#   DEMIURGOS_LANGUAGE   seeded data-root locale (default es)
+#   DEMIURGOS_WORLD      optional seeded world
+#   DEMIURGOS_SEED_ONLY  "1" -> seed-only entry point: run ONLY the
+#                        data-root bootstrap-once + .env seed (design S3-7)
+#                        and exit 0. No download, no uv, no staging, no
+#                        DEMIURGOS_URL_BASE required. Resolution order is the
+#                        installer's own (DEMIURGOS_DATA_ROOT env -> existing
+#                        pointer -> bootstrap-once). Idempotent: an existing
+#                        pointer and .env are preserved byte-for-byte.
+#   DEMIURGOS_FAKE_OS / DEMIURGOS_FAKE_ARCH / DEMIURGOS_FAKE_WINDOWS_VERSION /
+#   DEMIURGOS_FAKE_LONGPATHS
+#                        detection TEST SEAMS (same pattern as
+#                        DEMIURGOS_UV_SHA256): default to real detection;
+#                        hermetic harnesses simulate supported/unsupported
+#                        platforms without editing this script at runtime.
+#
+# Decision #3579 NARROWS the declared matrix: the .docx importer must be
+# uniform (present) on every supported system, so Windows on ARM/32-bit,
+# Windows below the floor and disabled long paths are NOT supported and fail
+# fast in the floors preflight with the documented manual-install alternative.
+# The closure proof (D3) confirms the exact minimum Windows version; the
+# mandatory/optional split stays as a safety net.
+# ---------------------------------------------------------------------------
+
+param(
+    # Install-time choice of the author-content folder (step 4). It PERSISTS:
+    # the value is written to the data-root pointer. DEMIURGOS_DATA_ROOT keeps
+    # its run-time meaning and leaves the pointer alone.
+    [string]$DataRoot
+)
+
+$ErrorActionPreference = "Stop"
+
+# --- defaults ---------------------------------------------------------------
+$urlBase = $env:DEMIURGOS_URL_BASE
+$installRoot = if ($env:DEMIURGOS_HOME) { $env:DEMIURGOS_HOME } else { Join-Path $env:LOCALAPPDATA "Demiurgos" }
+$version = if ($env:DEMIURGOS_VERSION) { $env:DEMIURGOS_VERSION } else { "latest" }
+$uvVersion = if ($env:UV_VERSION) { $env:UV_VERSION } else { "0.5.24" }
+$uvPythonInstallDir = Join-Path $installRoot "python"
+$stagingRoot = Join-Path $installRoot ".staging"
+# platformdirs user_config_dir("demiurgos") on Windows -> %APPDATA%\demiurgos
+# (the same config dir the S2b launcher and data_root.py resolve).
+$configDir = Join-Path $env:APPDATA "demiurgos"
+$pointerFile = Join-Path $configDir "data-root.json"
+# A relative -DataRoot is normalized before anything is written: a relative
+# value in the pointer would resolve against whoever reads it later.
+$dataRootChoice = if ($DataRoot) { [System.IO.Path]::GetFullPath($DataRoot) } else { "" }
+# Single documented Windows floor (decision #3579). The closure proof (D3)
+# confirms the exact minimum Windows version for the wheels-only mandatory
+# closure; the floors preflight enforces exactly this constant and the fail
+# message names it verbatim.
+$windowsMinMajor = 10
+$minFreeBytes = 2147483648   # 2 GiB
+
+# Detection with test seams (see the env contract above): DEMIURGOS_FAKE_*
+# default to the real values; hermetic harnesses override them to simulate
+# platforms without editing this script at runtime.
+$fakeOs = $env:DEMIURGOS_FAKE_OS
+$arch = if ($env:DEMIURGOS_FAKE_ARCH) { $env:DEMIURGOS_FAKE_ARCH } else { $env:PROCESSOR_ARCHITECTURE }
+
+# Work dirs created under the staging root (same filesystem, never a temp dir
+# on another FS). Removed on failure so a failed install leaves no debris and
+# no runnable state; the committed app/<version> is never touched.
+$workDirs = New-Object System.Collections.Generic.List[string]
+$script:stageDir = $null
+$script:payloadFile = $null
+$script:uvBin = $null
+$script:dataRoot = $null
+$script:envFile = $null
+# Verified channel manifest (SHA256SUMS); reused by the runtime provisioner so
+# the Hermes script is verified against the SAME signed manifest as the core.
+$script:sumsFile = $null
+
+# Dot-source the shared checksum verifier (design S3-2).
+. (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "lib\verify_checksum.ps1")
+
+function Fail([string]$message) {
+    throw "install-demiurgos: error: $message"
+}
+
+function Warn([string]$message) {
+    Write-Host "install-demiurgos: warning: $message" -ForegroundColor Yellow
+}
+
+function Remove-WorkDirs {
+    foreach ($d in $workDirs) {
+        Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if ($script:stageDir -and (Test-Path -LiteralPath $script:stageDir)) {
+        Remove-Item -LiteralPath $script:stageDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# --- OS / arch --------------------------------------------------------------
+
+function Get-UvArch {
+    switch ($arch) {
+        "AMD64" { return "x86_64" }
+        "x86_64" { return "x86_64" }
+        default {
+            Fail "Windows on $arch is not supported: Demiurgos requires Windows 10/11 on x86_64. Manual install alternative: run Demiurgos from source on this machine - see the installation guide"
+        }
+    }
+}
+
+function Get-UvTarget {
+    return "$(Get-UvArch)-pc-windows-msvc"
+}
+
+# --- floors preflight (5.3, decision #3579) ---------------------------------
+
+function Get-WindowsMajorVersion {
+    if ($env:DEMIURGOS_FAKE_WINDOWS_VERSION) {
+        return [int](($env:DEMIURGOS_FAKE_WINDOWS_VERSION -split "\.")[0])
+    }
+    $os = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name "CurrentMajorVersionNumber" -ErrorAction SilentlyContinue
+    if ($os -and $os.CurrentMajorVersionNumber) {
+        return [int]$os.CurrentMajorVersionNumber
+    }
+    return [int][System.Environment]::OSVersion.Version.Major
+}
+
+function Get-LongPathsEnabled {
+    if ($env:DEMIURGOS_FAKE_LONGPATHS) {
+        return ($env:DEMIURGOS_FAKE_LONGPATHS -eq "1")
+    }
+    $fs = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -ErrorAction SilentlyContinue
+    if ($fs -and $null -ne $fs.LongPathsEnabled) {
+        return ($fs.LongPathsEnabled -eq 1)
+    }
+    return $false
+}
+
+function Invoke-FloorsCheck {
+    # Decision #3579: Windows 10/11 x86_64 ONLY.
+    if ($fakeOs -and $fakeOs -ne "Windows") {
+        Fail "unsupported OS: $fakeOs (this core covers Windows; Linux/macOS is the POSIX core)"
+    }
+    Get-UvArch | Out-Null   # fails fast on ARM/32-bit with the manual alternative
+    $major = Get-WindowsMajorVersion
+    if ($major -lt $windowsMinMajor) {
+        Fail "Windows 10 or newer is required (found $major); upgrade Windows and re-run - or use the manual install alternative from the installation guide"
+    }
+    if (-not (Get-LongPathsEnabled)) {
+        Fail "Windows long paths (LongPathsEnabled) are disabled; enable the registry value HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled=1 and re-run - or use the manual install alternative from the installation guide"
+    }
+    $driveLetter = $installRoot.Substring(0, 1).ToUpper()
+    $drive = Get-PSDrive -Name $driveLetter -ErrorAction SilentlyContinue
+    if (-not $drive -or $drive.Free -lt $minFreeBytes) {
+        Fail "at least 2 GiB of free disk space is required at $installRoot (found $($drive.Free)); free space and re-run"
+    }
+}
+
+# --- download helpers (https + file:// test seam) ---------------------------
+
+function Invoke-Download([string]$url, [string]$dest) {
+    if ($url -like "file://*") {
+        Copy-Item -LiteralPath $url.Substring(7) -Destination $dest -Force
+    } elseif ($url -like "https://*") {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+    } else {
+        Fail "unsupported URL scheme in $url (use https:// or file://)"
+    }
+}
+
+function Get-DownloadStdout([string]$url) {
+    if ($url -like "file://*") {
+        return Get-Content -LiteralPath $url.Substring(7) -Raw
+    } elseif ($url -like "https://*") {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        return (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
+    } else {
+        Fail "unsupported URL scheme in $url (use https:// or file://)"
+    }
+}
+
+function Get-PayloadName([string]$file, [string]$version) {
+    $json = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+    if ($json.artifacts -and $json.artifacts.windows) {
+        return [string]$json.artifacts.windows
+    }
+    return "demiurgos-app-$version.zip"
+}
+
+function Get-ShaFor([string]$sumsFile, [string]$name) {
+    foreach ($line in Get-Content -LiteralPath $sumsFile) {
+        $parts = $line.Trim() -split "\s+"
+        if ($parts.Count -ge 2 -and $parts[1] -eq $name) { return $parts[0] }
+    }
+    return $null
+}
+
+# --- version resolve + release download (5.3) -------------------------------
+
+function Resolve-Version {
+    if ($script:version -eq "latest") {
+        $resolved = $null
+        try { $resolved = (Get-DownloadStdout "$urlBase/latest").Trim() } catch { $resolved = $null }
+        if (-not $resolved) {
+            # A channel with no stable release yet (beta-first): resolve the
+            # beta pointer explicitly and SAY SO, instead of failing a default
+            # install against a pointer that does not exist.
+            try { $resolved = (Get-DownloadStdout "$urlBase/latest-beta").Trim() } catch { $resolved = $null }
+            if ($resolved) {
+                Write-Host "install-demiurgos: note: no stable pointer yet; installing from the beta pointer $resolved"
+            }
+        }
+        $script:version = $resolved
+    }
+    if (-not $script:version) {
+        Fail "could not resolve a version from $urlBase/latest (and no latest-beta fallback); set DEMIURGOS_VERSION explicitly and re-run"
+    }
+    Write-Host "install-demiurgos: resolved version $script:version"
+}
+
+function Invoke-FetchAndVerifyPayload {
+    $workdir = Join-Path $stagingRoot ".work-$version-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $workDirs.Add($workdir)
+    New-Item -ItemType Directory -Force -Path $workdir | Out-Null
+    Invoke-Download "$urlBase/SHA256SUMS" (Join-Path $workdir "SHA256SUMS")
+    # Signature file is downloaded when present; verification is S5b's gate.
+    try { Invoke-Download "$urlBase/SHA256SUMS.minisig" (Join-Path $workdir "SHA256SUMS.minisig") } catch { }
+
+    # S5b (task 8.4): the manifest signature MUST be verified BEFORE any
+    # checksum is trusted - the exact ordering of the POSIX core. Fail-closed:
+    # a missing or invalid signature aborts the install, because a same-channel
+    # unsigned manifest is tamper-together.
+    if (-not (Test-Minisig -SumsFile (Join-Path $workdir "SHA256SUMS") -SignatureFile (Join-Path $workdir "SHA256SUMS.minisig"))) {
+        Fail "signed-manifest verification failed; the channel manifest is tampered or unsigned - fix the channel and re-run"
+    }
+    $script:sumsFile = Join-Path $workdir "SHA256SUMS"
+
+    # Platform-correct payload: the channel publishes one archive per package
+    # cell; Windows is windows-amd64. Older channels (and the hermetic fixtures)
+    # publish a single flat name, so fall back to version.json's `windows`
+    # pointer and then to the legacy flat name.
+    $payloadName = "demiurgos-app-$version-windows-amd64.zip"
+    $expected = Get-ShaFor $script:sumsFile $payloadName
+    if (-not $expected) {
+        Invoke-Download "$urlBase/version.json" (Join-Path $workdir "version.json")
+        $payloadName = Get-PayloadName (Join-Path $workdir "version.json") $version
+        $expected = Get-ShaFor $script:sumsFile $payloadName
+    }
+    if (-not $expected) {
+        Fail "no checksum entry for an installable payload in SHA256SUMS; fix the channel and re-run"
+    }
+    $script:payloadFile = Join-Path $workdir $payloadName
+    Invoke-Download "$urlBase/$payloadName" $payloadFile
+    if (-not (Verify-Sha256 -FilePath $payloadFile -Expected $expected)) {
+        Fail "checksum mismatch for $payloadName; the download is corrupt or tampered - fix the channel and re-run"
+    }
+}
+
+# --- product-owned Hermes runtime (S5/S7, hermes-core-runtime T4) ----------
+# Mirrors the POSIX core: download scripts/provision-hermes.ps1 from the SAME
+# signed channel manifest, verify it, then execute it. A missing script or
+# checksum entry is a channel defect, so the install fails closed.
+
+function Get-ChannelManifest {
+    if ($script:sumsFile -and (Test-Path -LiteralPath $script:sumsFile)) { return }
+    New-Item -ItemType Directory -Force -Path $stagingRoot | Out-Null
+    $workdir = Join-Path $stagingRoot ".work-manifest-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $workDirs.Add($workdir)
+    New-Item -ItemType Directory -Force -Path $workdir | Out-Null
+    $sums = Join-Path $workdir "SHA256SUMS"
+    Invoke-Download "$urlBase/SHA256SUMS" $sums
+    try { Invoke-Download "$urlBase/SHA256SUMS.minisig" (Join-Path $workdir "SHA256SUMS.minisig") } catch { }
+    if (-not (Test-Minisig -SumsFile $sums -SignatureFile (Join-Path $workdir "SHA256SUMS.minisig"))) {
+        Fail "signed-manifest verification failed; the channel manifest is tampered or unsigned - fix the channel and re-run"
+    }
+    $script:sumsFile = $sums
+}
+
+function Invoke-HermesProvision {
+    if ($env:DEMIURGOS_HERMES_SKIP -eq "1") {
+        Write-Host "install-demiurgos: Hermes runtime provisioning skipped (DEMIURGOS_HERMES_SKIP=1)"
+        return
+    }
+    Get-ChannelManifest
+    New-Item -ItemType Directory -Force -Path $stagingRoot | Out-Null
+    $workdir = Join-Path $stagingRoot ".work-provision-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $workDirs.Add($workdir)
+    New-Item -ItemType Directory -Force -Path $workdir | Out-Null
+    $script = Join-Path $workdir "provision-hermes.ps1"
+    Invoke-Download "$urlBase/scripts/provision-hermes.ps1" $script
+    $expected = Get-ShaFor $script:sumsFile "scripts/provision-hermes.ps1"
+    if (-not $expected) {
+        Fail "SHA256SUMS has no entry for scripts/provision-hermes.ps1; fix the channel and re-run"
+    }
+    if (-not (Verify-Sha256 -FilePath $script -Expected $expected)) {
+        Fail "checksum mismatch for scripts/provision-hermes.ps1; the download is corrupt or tampered - fix the channel and re-run"
+    }
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script -InstallRoot $installRoot
+    if ($LASTEXITCODE -ne 0) {
+        Fail "Hermes runtime provisioning failed; the assistant is required by default - see the error above and re-run"
+    }
+}
+
+# --- uv provisioning (5.3) ---------------------------------------------------
+
+function Import-UvChecksums {
+    # Load the channel's uv checksum table into UV_SHA_* environment variables.
+    # The publish job derives uv-shas.env from the exact archives it ships and
+    # lists it in the signed SHA256SUMS, so the table is verified before any
+    # value is trusted. Only whitelisted keys with a 64-hex value are accepted:
+    # the file is data, never code. DEMIURGOS_UV_SHA256 stays the single-target
+    # test seam and wins outright.
+    if ($env:DEMIURGOS_UV_SHA256) { return }
+    Get-ChannelManifest
+    $workdir = Join-Path $stagingRoot ".work-uvshas-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $workDirs.Add($workdir)
+    New-Item -ItemType Directory -Force -Path $workdir | Out-Null
+    $file = Join-Path $workdir "uv-shas.env"
+    Invoke-Download "$urlBase/uv-shas.env" $file
+    $expected = Get-ShaFor $script:sumsFile "uv-shas.env"
+    if (-not $expected) {
+        Fail "SHA256SUMS has no entry for uv-shas.env; fix the channel and re-run"
+    }
+    if (-not (Verify-Sha256 -FilePath $file -Expected $expected)) {
+        Fail "checksum mismatch for uv-shas.env; the download is corrupt or tampered - fix the channel and re-run"
+    }
+    $allowed = @(
+        "UV_SHA_X86_64_LINUX_GNU", "UV_SHA_AARCH64_LINUX_GNU",
+        "UV_SHA_X86_64_LINUX_MUSL", "UV_SHA_AARCH64_LINUX_MUSL",
+        "UV_SHA_X86_64_DARWIN", "UV_SHA_AARCH64_DARWIN",
+        "UV_SHA_X86_64_WINDOWS_MSVC"
+    )
+    foreach ($raw in Get-Content -LiteralPath $file) {
+        $line = "$raw".Trim()
+        if (-not $line -or $line.StartsWith("#")) { continue }
+        $parts = $line -split "=", 2
+        if ($parts.Count -ne 2) { continue }
+        $key = $parts[0].Trim()
+        $value = $parts[1].Trim()
+        if ($allowed -notcontains $key) { continue }
+        if ($value -notmatch '^[0-9a-fA-F]{64}$') {
+            Fail "uv-shas.env has a malformed sha256 for $key; fix the channel and re-run"
+        }
+        Set-Item -Path "env:$key" -Value $value.ToLowerInvariant()
+    }
+}
+
+function Get-UvExpectedSha256 {
+    if ($env:DEMIURGOS_UV_SHA256) { return $env:DEMIURGOS_UV_SHA256 }
+    # Filled by Import-UvChecksums from the channel's signed uv-shas.env. An
+    # empty table with no override -> refuse to install an unverified toolchain.
+    $t = Get-UvTarget
+    switch ($t) {
+        "x86_64-pc-windows-msvc" { return $env:UV_SHA_X86_64_WINDOWS_MSVC }
+        default { Fail "unsupported uv target: $t" }
+    }
+}
+
+function Invoke-ProvisionUv {
+    $target = Get-UvTarget
+    Import-UvChecksums
+    $expected = Get-UvExpectedSha256
+    if (-not $expected) {
+        Fail "no uv checksum available for $target; the channel's uv-shas.env has no entry for it - fix the channel and re-run"
+    }
+    $url = "$urlBase/uv/uv-$target-$uvVersion.zip"
+    $workdir = Join-Path $stagingRoot ".uv-$version-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $workDirs.Add($workdir)
+    New-Item -ItemType Directory -Force -Path $workdir | Out-Null
+    $archive = Join-Path $workdir "uv.zip"
+    Invoke-Download $url $archive
+    if (-not (Verify-Sha256 -FilePath $archive -Expected $expected)) {
+        Fail "checksum mismatch for the uv archive $url; refusing to install an unverified toolchain - fix the channel and re-run"
+    }
+    Expand-Archive -LiteralPath $archive -DestinationPath $workdir -Force
+    $uvFile = Get-ChildItem -Path $workdir -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -in @("uv.exe", "uv.ps1") } | Select-Object -First 1
+    if (-not $uvFile) {
+        Fail "the uv archive contains no uv binary; fix the channel and re-run"
+    }
+    New-Item -ItemType Directory -Force -Path (Join-Path $installRoot "bin") | Out-Null
+    # Nested Join-Path: PS 5.1 accepts only -Path/-ChildPath (a third positional
+    # child path is PS 6+ / -AdditionalChildPath) and would fail binding with
+    # "A positional parameter cannot be found that accepts argument 'uv.ps1'".
+    $script:uvBin = Join-Path (Join-Path $installRoot "bin") $uvFile.Name
+    Copy-Item -LiteralPath $uvFile.FullName -Destination $script:uvBin -Force
+    Write-Host "install-demiurgos: uv $uvVersion installed at $script:uvBin"
+}
+
+# --- stage, venv, install (5.3) ----------------------------------------------
+
+function Find-ReqFile([string]$name) {
+    foreach ($cand in @(
+        (Join-Path $script:stageDir $name),
+        (Join-Path $script:stageDir "src\tools\demiurgos-suite\$name")
+    )) {
+        if (Test-Path -LiteralPath $cand -PathType Leaf) { return $cand }
+    }
+    return $null
+}
+
+function Invoke-StageAndInstall {
+    $script:stageDir = Join-Path $stagingRoot "$version-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $workDirs.Add($script:stageDir)
+    New-Item -ItemType Directory -Force -Path $script:stageDir | Out-Null
+    try {
+        Expand-Archive -LiteralPath $payloadFile -DestinationPath $script:stageDir -Force
+    } catch {
+        Fail "cannot extract the payload; it may be corrupt - re-run"
+    }
+
+    $env:UV_PYTHON_INSTALL_DIR = $uvPythonInstallDir
+    & $script:uvBin python install 3.12
+    if ($LASTEXITCODE -ne 0) {
+        Fail "uv python install failed (uv unreachable or broken); no runnable state was left - re-run"
+    }
+    & $script:uvBin venv --python 3.12 (Join-Path $script:stageDir ".venv")
+    if ($LASTEXITCODE -ne 0) {
+        Fail "uv venv creation failed; no runnable state was left - re-run"
+    }
+
+    $venvPython = Join-Path $script:stageDir ".venv\Scripts\python.exe"
+    $req = Find-ReqFile "requirements.lock"
+    if (-not $req) { $req = Find-ReqFile "requirements.txt" }
+    if (-not $req) {
+        Fail "no hash-locked requirements file (requirements.lock) in the payload; refusing a non-locked install - fix the channel and re-run"
+    }
+
+    & $script:uvBin pip install --python $venvPython --require-hashes --only-binary=:all: -r $req
+    if ($LASTEXITCODE -ne 0) {
+        Fail "the mandatory wheel-only install failed; aborting with no runnable half-install - see the error above and re-run"
+    }
+
+    $opt = Find-ReqFile "requirements-optional.txt"
+    if ($opt) {
+        & $script:uvBin pip install --python $venvPython --only-binary=:all: -r $opt
+        if ($LASTEXITCODE -ne 0) {
+            Warn "optional extras failed to install; the app runs with degraded optional features (document conversion / live watching unavailable)"
+        }
+    } else {
+        Warn "no requirements-optional.txt in the payload; optional extras are skipped"
+    }
+}
+
+function Invoke-CommitStaging {
+    $target = Join-Path $installRoot "app\$version"
+    New-Item -ItemType Directory -Force -Path (Join-Path $installRoot "app") | Out-Null
+    if (Test-Path -LiteralPath $target) {
+        Remove-Item -LiteralPath $target -Recurse -Force
+    }
+    # Same-FS rename (staging lives under <install_root>\.staging).
+    Move-Item -LiteralPath $stageDir -Destination $target
+    $script:stageDir = $null
+    # Flip `current` as a JUNCTION (S0-C: junction, not symlink). Deleting a
+    # junction removes the link only, never the target app/<version>.
+    $current = Join-Path $installRoot "current"
+    $currentItem = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+    if ($currentItem) {
+        if ($currentItem.LinkType) {
+            $currentItem.Delete()
+        } else {
+            Fail "current exists and is not a junction; refusing to clobber it"
+        }
+    }
+    New-Item -ItemType Junction -Path $current -Target $target | Out-Null
+    Write-Host "install-demiurgos: installed $version at $installRoot\current"
+}
+
+function Write-ChannelConfig {
+    # Persist the channel base URL this install validated (https:// or
+    # file:// - `Invoke-Download` fails on any other scheme) so the runtime
+    # updater resolves it WITHOUT the env override (design S2-b). Written next
+    # to Invoke-CommitStaging because it records the channel this install
+    # trusts. Backslashes (file://C:\...) are JSON-escaped like the data-root
+    # record; UTF-8 without BOM.
+    $escapedBase = $urlBase.Replace("\", "\\")
+    $record = @"
+{
+  "schema_version": 1,
+  "url_base": "$escapedBase"
+}
+"@
+    [System.IO.File]::WriteAllText(
+        (Join-Path $installRoot "channel.json"), $record,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+    Write-Host "install-demiurgos: persisted channel config at $installRoot\channel.json"
+}
+
+# --- data-root bootstrap-once + .env seed (5.3, S0-A) ------------------------
+
+function Invoke-SeedEnvFile {
+    $script:envFile = Join-Path $script:dataRoot ".env"
+    if (-not (Test-Path -LiteralPath $envFile -PathType Leaf)) {
+        $locale = if ($env:DEMIURGOS_LANGUAGE) { $env:DEMIURGOS_LANGUAGE } else { "es" }
+        $lines = @("DEMIURGOS_AUTH_MODE=local-dev", "DEMIURGOS_LANGUAGE=$locale")
+        # A released install must know where a report goes, or no report can
+        # reach the triage group (S18). Overridable for a private relay.
+        $relayUrl = if ($env:DEMIURGOS_BUGREPORT_RELAY_URL) {
+            $env:DEMIURGOS_BUGREPORT_RELAY_URL
+        } else {
+            "https://demiurgos-bugreport-relay.demiurgos.workers.dev"
+        }
+        $botUsername = if ($env:DEMIURGOS_BUGREPORT_BOT_USERNAME) {
+            $env:DEMIURGOS_BUGREPORT_BOT_USERNAME
+        } else {
+            "ReportesDemiurgosBot"
+        }
+        $lines += "DEMIURGOS_BUGREPORT_RELAY_URL=$relayUrl"
+        $lines += "DEMIURGOS_BUGREPORT_BOT_USERNAME=$botUsername"
+        if ($env:DEMIURGOS_WORLD) { $lines += "DEMIURGOS_WORLD=$($env:DEMIURGOS_WORLD)" }
+        Set-Content -LiteralPath $envFile -Value $lines -Encoding ASCII
+        Write-Host "install-demiurgos: seeded $envFile (DEMIURGOS_AUTH_MODE=local-dev)"
+    }
+}
+
+function Get-DocumentsDir {
+    # Default content root (step 3): the OS documents folder, never a literal
+    # $env:USERPROFILE\Documents. The shell API follows a redirection (OneDrive
+    # Known Folder Move) and the user's localized folder name. Pure .NET, no
+    # extra module.
+    $path = [Environment]::GetFolderPath('MyDocuments')
+    if ([string]::IsNullOrWhiteSpace($path)) {
+        $path = Join-Path $env:USERPROFILE 'Documents'
+    }
+    return $path
+}
+
+function New-ContentDirs {
+    New-Item -ItemType Directory -Force -Path $configDir, $script:dataRoot,
+        (Join-Path $script:dataRoot "mundos"), (Join-Path $script:dataRoot "ideas"),
+        (Join-Path $script:dataRoot "data"), (Join-Path $script:dataRoot "config") | Out-Null
+}
+
+function Write-PointerRecord {
+    # Byte-compatible with data_root.py write_pointer (schema_version 1,
+    # json.dumps indent 2, trailing newline) so read_pointer reads it back.
+    # UTF-8 without BOM: a Windows username may contain non-ASCII characters.
+    New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+    $escaped = $script:dataRoot.Replace("\", "\\")
+    $stamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $record = @"
+{
+  "schema_version": 1,
+  "data_root": "$escaped",
+  "updated_at": "$stamp"
+}
+"@
+    [System.IO.File]::WriteAllText(
+        $pointerFile, $record,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+}
+
+function Get-PointerValue {
+    if (-not (Test-Path -LiteralPath $pointerFile -PathType Leaf)) { return "" }
+    try {
+        $record = Get-Content -LiteralPath $pointerFile -Raw | ConvertFrom-Json
+        if ($record.data_root) { return [string]$record.data_root }
+        return ""
+    } catch {
+        Fail "data-root pointer $pointerFile is unreadable; refusing to guess"
+    }
+}
+
+function Invoke-DataRootBootstrap {
+    # 1. Explicit install-time choice: it persists.
+    if ($dataRootChoice) {
+        $script:dataRoot = $dataRootChoice
+        New-ContentDirs
+        $previous = Get-PointerValue
+        if ($previous -and $previous -ne $script:dataRoot) {
+            Write-Host "install-demiurgos: reorienting the data root on explicit request: $previous -> $script:dataRoot"
+        }
+        Write-PointerRecord
+        Write-Host "install-demiurgos: the author content lives in $script:dataRoot"
+        Write-Host "install-demiurgos: recorded in $pointerFile; change it with -DataRoot or from the app"
+        Invoke-SeedEnvFile
+        return
+    }
+    # 2. Environment override for this install only: never touches the pointer.
+    if ($env:DEMIURGOS_DATA_ROOT) {
+        $script:dataRoot = $env:DEMIURGOS_DATA_ROOT
+        New-ContentDirs
+        Write-Host "install-demiurgos: using DEMIURGOS_DATA_ROOT=$script:dataRoot (override; the choice is NOT recorded)"
+        Write-Host "install-demiurgos: pass -DataRoot to record $script:dataRoot for every later start"
+        Invoke-SeedEnvFile
+        return
+    }
+    # 3. An existing pointer is preserved byte-for-byte.
+    $pointed = Get-PointerValue
+    if ($pointed) {
+        $script:dataRoot = $pointed
+        Write-Host "install-demiurgos: preserving existing data-root pointer -> $script:dataRoot"
+        return
+    }
+    # 4. Bootstrap-once the default <documents>\Demiurgos.
+    $script:dataRoot = Join-Path (Get-DocumentsDir) "Demiurgos"
+    New-ContentDirs
+    Write-PointerRecord
+    Write-Host "install-demiurgos: the author content lives in $script:dataRoot"
+    Write-Host "install-demiurgos: change it with -DataRoot or from the app"
+    Invoke-SeedEnvFile
+}
+
+# --- Windows Start Menu entry ----------------------------------------------
+# Parity with the Linux applications-menu entry: written by the installer and
+# never fatal. The visible Desktop icon stays opt-in
+# (start-demiurgos.ps1 install -Desktop), so a re-run can always repair the
+# entry without touching the user's own Desktop folder.
+#
+# The helper is read from the installed app, not from wherever this installer
+# happens to sit, and it is dot-sourced only here: an older payload without
+# scripts\lib\desktop-shortcut.ps1 degrades to a warning.
+function Install-StartMenuShortcut {
+    $appRoot = Join-Path $installRoot "current"
+    $lib = Join-Path $appRoot "scripts\lib\desktop-shortcut.ps1"
+    if (-not (Test-Path -LiteralPath $lib -PathType Leaf)) {
+        Warn "no scripts\lib\desktop-shortcut.ps1 in the payload; the Start Menu entry is skipped"
+        return
+    }
+    try {
+        . $lib
+        $written = Install-DemiurgosShortcuts -AppRoot $appRoot
+        foreach ($entry in $written) {
+            Write-Host "install-demiurgos: Start Menu entry at $entry"
+        }
+    } catch {
+        Warn "could not write the Start Menu entry: $($_.Exception.Message)"
+    }
+}
+
+# --- seed-only entry point (S0-A; test/ops seam) -----------------------------
+# DEMIURGOS_SEED_ONLY=1 performs ONLY the data-root bootstrap-once + .env seed
+# (design S3-7) and exits 0 - the exact code path the full install runs at the
+# end (Invoke-DataRootBootstrap), so a Windows gated-write regression harness
+# can exercise the REAL shipping seed against a tmp APPDATA/DEMIURGOS_HOME.
+# Never downloads, never touches uv, never requires DEMIURGOS_URL_BASE.
+# Idempotence is preserved: an existing pointer and an existing .env are left
+# byte-for-byte untouched.
+if ($env:DEMIURGOS_SEED_ONLY -eq "1") {
+    try {
+        Invoke-DataRootBootstrap
+        Write-Host "install-demiurgos: seed-only done; data root is $script:dataRoot"
+    } catch {
+        Write-Host $_.Exception.Message -ForegroundColor Red
+        exit 1
+    }
+    exit 0
+}
+
+# --- main --------------------------------------------------------------------
+
+try {
+    if (-not $urlBase) {
+        Fail "DEMIURGOS_URL_BASE is not set; it is required (https:// or file:// channel base)"
+    }
+
+    New-Item -ItemType Directory -Force -Path $installRoot | Out-Null
+    Invoke-FloorsCheck
+    Resolve-Version
+
+    # Idempotent re-run: same version already current -> exit 0, nothing to do.
+    $current = Join-Path $installRoot "current"
+    $currentItem = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+    $alreadyCurrent = $false
+    if ($currentItem -and $currentItem.LinkType) {
+        $targetExpected = Join-Path $installRoot "app\$version"
+        if ([string]$currentItem.Target -eq $targetExpected -and (Test-Path -LiteralPath $targetExpected)) {
+            $alreadyCurrent = $true
+        }
+    }
+    if ($alreadyCurrent) {
+        Write-Host "install-demiurgos: $version is already installed and current; nothing to do"
+        # ...except the Start Menu entry and the assistant runtime, which are
+        # the installer's own to own: a user who deleted the entry, or an
+        # earlier install that predates the runtime, is repaired by re-running
+        # the installer without reinstalling the app.
+        Install-StartMenuShortcut
+        Invoke-HermesProvision
+        exit 0
+    }
+
+    New-Item -ItemType Directory -Force -Path $stagingRoot | Out-Null
+    Invoke-FetchAndVerifyPayload
+    Invoke-ProvisionUv
+    Invoke-StageAndInstall
+    Invoke-CommitStaging
+    Write-ChannelConfig
+    Invoke-HermesProvision
+    Invoke-DataRootBootstrap
+    Install-StartMenuShortcut
+
+    Write-Host "install-demiurgos: done. Start Demiurgos with:"
+    Write-Host "  $installRoot\current\scripts\start-demiurgos.ps1 start"
+} catch {
+    Remove-WorkDirs
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    exit 1
+}
