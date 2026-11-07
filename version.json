@@ -1,36 +1,36 @@
 {
-  "version": "0.2.6",
+  "version": "0.2.7",
   "artifacts": {
     "linux-aarch64": {
-      "artifact": "demiurgos-app-0.2.6-linux-aarch64.tar.gz",
+      "artifact": "demiurgos-app-0.2.7-linux-aarch64.tar.gz",
       "format": "tar.gz",
-      "sha256": "7f489a69e234e6be80e19bbb57fe1c3fc4c8f43edc0e6a1a7afc5e9e6cf2d36d"
+      "sha256": "7334f6e0878aa9d5294dcb5fba63c7596e4ee9ea9e076118d8f75a6721474867"
     },
     "linux-x86_64": {
-      "artifact": "demiurgos-app-0.2.6-linux-x86_64.tar.gz",
+      "artifact": "demiurgos-app-0.2.7-linux-x86_64.tar.gz",
       "format": "tar.gz",
-      "sha256": "4456ef2feb1f0d1b41dda8cd1f10c4a988a2f8f4450746d028dc20aa3d0c49c1"
+      "sha256": "fee8242fc2bdc51a33062f2c73667233f006499e8d5186d227bd6d34f5df4b4c"
     },
     "macos-arm64": {
-      "artifact": "demiurgos-app-0.2.6-macos-arm64.tar.gz",
+      "artifact": "demiurgos-app-0.2.7-macos-arm64.tar.gz",
       "format": "tar.gz",
-      "sha256": "5c5f3af0a328cb1cd9dff230b13958058ed13cf7826005f1323d0ee8f8da9220"
+      "sha256": "be95951dbf7f6149a6945519f317d930c64fc54194e561f34d0afad16512b6ce"
     },
     "windows-amd64": {
-      "sha256": "d36b84283529643f4dcde7f9990fc0b5cc55eba41858fed2efb52af7eabf01dd",
-      "artifact": "demiurgos-app-0.2.6-windows-amd64.zip",
-      "format": "zip"
+      "artifact": "demiurgos-app-0.2.7-windows-amd64.zip",
+      "format": "zip",
+      "sha256": "2f57a7e85f317df68af09bec93bc4b55ccc7085b63c90dbe6bf1bc65f736c26b"
     }
   },
   "floors": {
+    "windows": "10/11 x86_64",
     "macos": ">= 13 arm64 (Apple Silicon)",
-    "linux": "glibc >= 2.28 (x86_64 / aarch64)",
-    "windows": "10/11 x86_64"
+    "linux": "glibc >= 2.28 (x86_64 / aarch64)"
   },
-  "posix": "demiurgos-app-0.2.6-linux-x86_64.tar.gz",
-  "windows": "demiurgos-app-0.2.6-windows-amd64.zip",
+  "posix": "demiurgos-app-0.2.7-linux-x86_64.tar.gz",
+  "windows": "demiurgos-app-0.2.7-windows-amd64.zip",
   "sha256": {
-    "posix": "4456ef2feb1f0d1b41dda8cd1f10c4a988a2f8f4450746d028dc20aa3d0c49c1",
-    "windows": "d36b84283529643f4dcde7f9990fc0b5cc55eba41858fed2efb52af7eabf01dd"
+    "posix": "fee8242fc2bdc51a33062f2c73667233f006499e8d5186d227bd6d34f5df4b4c",
+    "windows": "2f57a7e85f317df68af09bec93bc4b55ccc7085b63c90dbe6bf1bc65f736c26b"
   }
 }
