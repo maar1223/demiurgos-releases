@@ -1,25 +1,25 @@
 {
-  "version": "0.4.2",
+  "version": "0.4.3",
   "artifacts": {
     "linux-aarch64": {
-      "artifact": "demiurgos-app-0.4.2-linux-aarch64.tar.gz",
+      "artifact": "demiurgos-app-0.4.3-linux-aarch64.tar.gz",
       "format": "tar.gz",
-      "sha256": "3c88eb54349ab9414641cec31fb5abce3aa96f97c83377ae1435bde6dad5b411"
+      "sha256": "be8b48df4e8a1512fa50fd7408f442b56c550f1a03852bb3700060b9baca0dd7"
     },
     "linux-x86_64": {
-      "artifact": "demiurgos-app-0.4.2-linux-x86_64.tar.gz",
+      "artifact": "demiurgos-app-0.4.3-linux-x86_64.tar.gz",
       "format": "tar.gz",
-      "sha256": "30b49643c8511aa101e171dcfdfeb9673693a9e0bb0950969c29f10758049e46"
+      "sha256": "a7524ff03562f5d8ecaf713bcdb237855c2272a24f5077cfb66177069d97cc00"
     },
     "macos-arm64": {
-      "artifact": "demiurgos-app-0.4.2-macos-arm64.tar.gz",
+      "artifact": "demiurgos-app-0.4.3-macos-arm64.tar.gz",
       "format": "tar.gz",
-      "sha256": "4a85f33bf4f96848d997b1a7fd6123ece4c77082fce7bdc09a65c44c62002277"
+      "sha256": "b7fe9acc3ad1726d2f42c05908ddfa7ad4997c1babbe0e139f58deeeb9b778d3"
     },
     "windows-amd64": {
+      "artifact": "demiurgos-app-0.4.3-windows-amd64.zip",
       "format": "zip",
-      "sha256": "5892705c9fb7c1593c8116bac9173d5bfb13a18208d7b09f015e943941ca9d33",
-      "artifact": "demiurgos-app-0.4.2-windows-amd64.zip"
+      "sha256": "586c070ee643235d0d0d083ac0c879550ee9418c70b86fd57c2ee21116c98f3f"
     }
   },
   "floors": {
@@ -27,10 +27,10 @@
     "macos": ">= 13 arm64 (Apple Silicon)",
     "windows": "10/11 x86_64"
   },
-  "posix": "demiurgos-app-0.4.2-linux-x86_64.tar.gz",
-  "windows": "demiurgos-app-0.4.2-windows-amd64.zip",
+  "posix": "demiurgos-app-0.4.3-linux-x86_64.tar.gz",
+  "windows": "demiurgos-app-0.4.3-windows-amd64.zip",
   "sha256": {
-    "posix": "30b49643c8511aa101e171dcfdfeb9673693a9e0bb0950969c29f10758049e46",
-    "windows": "5892705c9fb7c1593c8116bac9173d5bfb13a18208d7b09f015e943941ca9d33"
+    "posix": "a7524ff03562f5d8ecaf713bcdb237855c2272a24f5077cfb66177069d97cc00",
+    "windows": "586c070ee643235d0d0d083ac0c879550ee9418c70b86fd57c2ee21116c98f3f"
   }
 }
