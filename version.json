@@ -1,36 +1,36 @@
 {
-  "version": "0.5.0",
+  "version": "0.6.0",
   "artifacts": {
     "linux-aarch64": {
-      "artifact": "demiurgos-app-0.5.0-linux-aarch64.tar.gz",
+      "artifact": "demiurgos-app-0.6.0-linux-aarch64.tar.gz",
       "format": "tar.gz",
-      "sha256": "cb5c66ef7f100d623f731766f1141b8ee319fd1323ce1976d92a753e3b1caf95"
+      "sha256": "6e736830bd9da4d10525b3acad0af17c6cda9c8bc3ecf875f71bc29a1727921b"
     },
     "linux-x86_64": {
-      "artifact": "demiurgos-app-0.5.0-linux-x86_64.tar.gz",
+      "artifact": "demiurgos-app-0.6.0-linux-x86_64.tar.gz",
       "format": "tar.gz",
-      "sha256": "23bf2bfb29a85ea20b68d49b2af922e98157faa4381f947f1024273b6ac67a27"
+      "sha256": "b326e6d1682a6b8e27e5294464aec44486a5c2eb71409fe4a368bd64709b05b9"
     },
     "macos-arm64": {
-      "artifact": "demiurgos-app-0.5.0-macos-arm64.tar.gz",
+      "artifact": "demiurgos-app-0.6.0-macos-arm64.tar.gz",
       "format": "tar.gz",
-      "sha256": "a8c4c0da7a3a9fb94ca3dd7e7dbed0bb3d91d8703f3b693e1db8b67d811a7e0b"
+      "sha256": "8a6ee04e9e1ad871300109c8fcf5a3c48b4d7c445c4ae01ff77f28c2e9727065"
     },
     "windows-amd64": {
-      "format": "zip",
-      "artifact": "demiurgos-app-0.5.0-windows-amd64.zip",
-      "sha256": "81ddf7db605b69c181e8a930837ab096ae25e2cfea2eb54addb09c3c9fce6184"
+      "sha256": "c81b3d503c8bfde84eca7dd44f7e248401dad643365d0f4476199d72ed66011f",
+      "artifact": "demiurgos-app-0.6.0-windows-amd64.zip",
+      "format": "zip"
     }
   },
   "floors": {
-    "linux": "glibc >= 2.28 (x86_64 / aarch64)",
+    "windows": "10/11 x86_64",
     "macos": ">= 13 arm64 (Apple Silicon)",
-    "windows": "10/11 x86_64"
+    "linux": "glibc >= 2.28 (x86_64 / aarch64)"
   },
-  "posix": "demiurgos-app-0.5.0-linux-x86_64.tar.gz",
-  "windows": "demiurgos-app-0.5.0-windows-amd64.zip",
+  "posix": "demiurgos-app-0.6.0-linux-x86_64.tar.gz",
+  "windows": "demiurgos-app-0.6.0-windows-amd64.zip",
   "sha256": {
-    "posix": "23bf2bfb29a85ea20b68d49b2af922e98157faa4381f947f1024273b6ac67a27",
-    "windows": "81ddf7db605b69c181e8a930837ab096ae25e2cfea2eb54addb09c3c9fce6184"
+    "posix": "b326e6d1682a6b8e27e5294464aec44486a5c2eb71409fe4a368bd64709b05b9",
+    "windows": "c81b3d503c8bfde84eca7dd44f7e248401dad643365d0f4476199d72ed66011f"
   }
 }
