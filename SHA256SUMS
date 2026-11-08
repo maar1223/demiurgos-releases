@@ -55,6 +55,10 @@ b7fe9acc3ad1726d2f42c05908ddfa7ad4997c1babbe0e139f58deeeb9b778d3  demiurgos-app-
 5cbcd8c03997fdd3d53a4e952d3bae74f69caf259c86fc244acf501cb5ec5a59  demiurgos-app-0.4.4-linux-x86_64.tar.gz
 5c889eb18d6676daf70f43a474dea633d9e4eb9c9b2401689e1f9aa09cfea0fb  demiurgos-app-0.4.4-macos-arm64.tar.gz
 459cbf2efaddc5ca7d5f63374593b582b8afee599606dc223791746049b9d853  demiurgos-app-0.4.4-windows-amd64.zip
+e0dc031ed8d8f2f9aee0f07c384006dc80a45bbf9a15978aa8ed0d6096c6a880  demiurgos-app-0.4.5-linux-aarch64.tar.gz
+1f4e19e87f478c5b9f2ee41ae9adaaddc23c371a3403b5c2771570c04e7e83f1  demiurgos-app-0.4.5-linux-x86_64.tar.gz
+003f6eeff6f8db286a7a0a560ca332090af5b1f801f7480e795503b71b23d8a7  demiurgos-app-0.4.5-macos-arm64.tar.gz
+e687cf4bb32b408444a1cc96e79c2a339e08150620c00381d73dd3e941c392fd  demiurgos-app-0.4.5-windows-amd64.zip
 6ee3fa3980e6643903eac7d281d61e2e1e21788070153f760de3b162b6a7d089  install.ps1
 8516cd42d73da886e53210e35fc5196029313c7f3d9e1c57a7dc087cb41bb094  install.sh
 3bdd9f77568c9c748b96c089979b649f7886adc3444b670e405931488ddd06d3  scripts/install-demiurgos.ps1
@@ -68,4 +72,4 @@ cb987293e934d3ce8f709f787158313f5007ec7696e6d502c8c2df04fa839038  scripts/lib/ve
 3cf910468c37c709580d83d19b7b55352cfe05d6e1cc038718698410b6b8c6f0  uv/uv-aarch64-unknown-linux-gnu-0.5.24.tar.gz
 bd3fedeee0da543d7ac0a530328b3880bc83c1b332b3996f0da691f83423e813  uv/uv-x86_64-pc-windows-msvc-0.5.24.zip
 a0eb614f7fc38a6e14ef1c4819f1f187591db8e0d3c4218dae38b1bd663a00e2  uv/uv-x86_64-unknown-linux-gnu-0.5.24.tar.gz
-099fd754140e52cb29811e3659f4afe7b505ba33ffacfe1f3ec48f84539e0882  version.json
+31b43cd5dd658645a0c5bb1b3fb8213ef257f4897c6119b3a6af16006b99f545  version.json
