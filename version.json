@@ -1,36 +1,36 @@
 {
-  "version": "0.8.1",
+  "version": "0.8.2",
   "artifacts": {
     "linux-aarch64": {
-      "artifact": "demiurgos-app-0.8.1-linux-aarch64.tar.gz",
+      "artifact": "demiurgos-app-0.8.2-linux-aarch64.tar.gz",
       "format": "tar.gz",
-      "sha256": "0c9f723d0946e83eed606202ed2c0a79fe46f8e9b1a70655fa95bf81717e03fc"
+      "sha256": "6c01a07ae626e81dc5954390eb9f518e1657780a2afe41db825921c8cfce9b86"
     },
     "linux-x86_64": {
-      "artifact": "demiurgos-app-0.8.1-linux-x86_64.tar.gz",
+      "artifact": "demiurgos-app-0.8.2-linux-x86_64.tar.gz",
       "format": "tar.gz",
-      "sha256": "011eb110802956c94849212d8a1cf1b380155a6692596ec475e7b4db57f518ea"
+      "sha256": "83eadbd6909b16edd50bbf7999eb7401c525c55f627724b79c2a6cdacd569052"
     },
     "macos-arm64": {
-      "artifact": "demiurgos-app-0.8.1-macos-arm64.tar.gz",
+      "artifact": "demiurgos-app-0.8.2-macos-arm64.tar.gz",
       "format": "tar.gz",
-      "sha256": "7daa60e97790e84cbc7cefcd21930a0ec8670b169b792805e8d0873641126c34"
+      "sha256": "9bca3b91a89b39f9a70484e0a31a46f1ce0eab2ae4e77bdeb122d24ca1aba344"
     },
     "windows-amd64": {
       "format": "zip",
-      "sha256": "222fcc3f5ea7d435f8faba00e5ba1a6bc8919294278d728ac81941651bc9d8d2",
-      "artifact": "demiurgos-app-0.8.1-windows-amd64.zip"
+      "sha256": "26838610e1b1943cf284ce5b94d9be871d67aec462a162d46207254ddb24d2ac",
+      "artifact": "demiurgos-app-0.8.2-windows-amd64.zip"
     }
   },
   "floors": {
-    "windows": "10/11 x86_64",
     "macos": ">= 13 arm64 (Apple Silicon)",
+    "windows": "10/11 x86_64",
     "linux": "glibc >= 2.28 (x86_64 / aarch64)"
   },
-  "posix": "demiurgos-app-0.8.1-linux-x86_64.tar.gz",
-  "windows": "demiurgos-app-0.8.1-windows-amd64.zip",
+  "posix": "demiurgos-app-0.8.2-linux-x86_64.tar.gz",
+  "windows": "demiurgos-app-0.8.2-windows-amd64.zip",
   "sha256": {
-    "posix": "011eb110802956c94849212d8a1cf1b380155a6692596ec475e7b4db57f518ea",
-    "windows": "222fcc3f5ea7d435f8faba00e5ba1a6bc8919294278d728ac81941651bc9d8d2"
+    "posix": "83eadbd6909b16edd50bbf7999eb7401c525c55f627724b79c2a6cdacd569052",
+    "windows": "26838610e1b1943cf284ce5b94d9be871d67aec462a162d46207254ddb24d2ac"
   }
 }
