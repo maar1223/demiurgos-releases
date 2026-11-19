@@ -601,8 +601,18 @@ applications_dir() {
     printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 }
 
+install_entrypoint() {
+    # Copy, never execute: the payload stays data. The wrapper lives outside
+    # `current` so an install or rollback flip cannot break the shortcut.
+    local bin="$INSTALL_ROOT/bin"
+    mkdir -p "$bin" 2>/dev/null || return 1
+    cp "$INSTALL_ROOT/current/scripts/demiurgos" "$bin/demiurgos" 2>/dev/null || return 1
+    chmod 0755 "$bin/demiurgos" 2>/dev/null || true
+    printf '%s\n' "$bin/demiurgos"
+}
+
 install_desktop_entry() {
-    local app_root="$INSTALL_ROOT/current" template menu_dir
+    local app_root="$INSTALL_ROOT/current" template menu_dir entry
     [ "$OS" = "Linux" ] || return 0
     template="$app_root/$DESKTOP_TEMPLATE_REL"
     if [ ! -f "$template" ]; then
@@ -612,7 +622,9 @@ install_desktop_entry() {
     menu_dir="$(applications_dir)"
     mkdir -p "$menu_dir" 2>/dev/null \
         || { warn "cannot create $menu_dir; the applications menu entry is skipped"; return 0; }
-    sed "s|@PROJECT_ROOT@|$app_root|g" "$template" > "$menu_dir/Demiurgos.desktop" 2>/dev/null \
+    entry="$(install_entrypoint || printf '%s' "$app_root/scripts/start-demiurgos.sh")"
+    sed -e "s|@PROJECT_ROOT@|$app_root|g" -e "s|@LAUNCHER_ENTRY@|$entry|g" \
+        "$template" > "$menu_dir/Demiurgos.desktop" 2>/dev/null \
         || { warn "cannot write the applications menu entry; skipped"; return 0; }
     chmod 0644 "$menu_dir/Demiurgos.desktop" 2>/dev/null || true
     printf 'install-demiurgos: applications menu entry at %s/Demiurgos.desktop\n' "$menu_dir" >&2
@@ -768,6 +780,46 @@ restart_after_install() {
     return 0
 }
 
+# --- assistant world-reading wiring (contract) -------------------------------
+# docs/architecture/ASSISTANT_WORLD_READING.md: the assistant reads the author's
+# world through the demiurgos-graph MCP server. Without that registration the
+# assistant answers like a generic chat, and nothing else in the product fails.
+# The payload's merge is idempotent AND corrective (it rewrites a stale entry
+# such as --mundos-path pointing at the code tree). Best-effort by design: a
+# failure warns loudly and never aborts an otherwise valid install.
+provision_graph_mcp() {
+    local home="${DEMIURGOS_HERMES_HOME:-$INSTALL_ROOT/hermes}"
+    local python="$INSTALL_ROOT/current/.venv/bin/python"
+    local wiki="$INSTALL_ROOT/current/src/tools/demiurgos-suite/wiki"
+    local config="$home/config.yaml"
+
+    # Skipped assistant runtime (DEMIURGOS_HERMES_SKIP=1) or no profile yet:
+    # never create a config.yaml the runtime provisioner is supposed to seed.
+    [ -d "$home" ] || return 0
+
+    if [ ! -x "$python" ] || [ ! -f "$wiki/hermes_profile_config.py" ]; then
+        printf 'install-demiurgos: cannot wire the assistant graph (python or merge module missing); the assistant will NOT read the world\n' >&2
+        return 0
+    fi
+
+    if "$python" - "$wiki" "$config" <<'PY'
+import sys
+from pathlib import Path
+
+# Registers mcp_servers.demiurgos-graph -> mcp_launcher.py, which resolves the
+# data root and the world at runtime. Never a hardcoded --mundos-path.
+sys.path.insert(0, sys.argv[1])
+from hermes_profile_config import merge_graph_mcp_server
+
+merge_graph_mcp_server(Path(sys.argv[2]))
+PY
+    then
+        printf 'install-demiurgos: assistant graph wired at %s\n' "$config" >&2
+    else
+        printf 'install-demiurgos: WARNING: the assistant graph could not be wired; it will NOT read the world — see docs/architecture/ASSISTANT_WORLD_READING.md\n' >&2
+    fi
+}
+
 # --- main --------------------------------------------------------------------
 
 [ -n "$URL_BASE" ] || fail "DEMIURGOS_URL_BASE is not set; it is required (https:// or file:// channel base)"
@@ -787,6 +839,7 @@ if [ -L "$INSTALL_ROOT/current" ] && [ "$(readlink "$INSTALL_ROOT/current")" = "
     install_desktop_entry
     mkdir -p "$STAGING_ROOT"
     provision_hermes_runtime
+    provision_graph_mcp
     if [ "${DEMIURGOS_RESTART_AFTER_INSTALL:-0}" = "1" ]; then
         restart_after_install
     fi
@@ -800,6 +853,7 @@ stage_and_install
 commit_staging
 write_channel_config
 provision_hermes_runtime
+provision_graph_mcp
 bootstrap_data_root
 install_desktop_entry
 
