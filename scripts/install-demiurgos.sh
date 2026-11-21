@@ -33,7 +33,10 @@
 #                            pointer) or, without it, bootstrap-once the
 #                            default <documents>/Demiurgos + .env seed; the
 #                            DEMIURGOS_DATA_ROOT override never writes the
-#                            pointer but always seeds .env (S0-A, step 4)
+#                            pointer but always seeds .env (S0-A, step 4).
+#                            The payload's foundational methodology seeds are
+#                            copied once into the data root (the app reads
+#                            them there, never from the code tree).
 #
 # The core NEVER runs a package manager other than the verified uv, NEVER
 # executes files from the payload (only the launcher the user starts runs),
@@ -698,6 +701,52 @@ ensure_content_dirs() {
         "$DATA_ROOT/data" "$DATA_ROOT/config"
 }
 
+# The payload ships the authoritative foundational seeds, and the app reads them
+# from the DATA root (`api_server._methodology_library`) while only upgrading an
+# existing copy forward (`methodology_seed.reconcile_seed_root`). Bootstrapping
+# a missing data-root copy is therefore the installer's job: copy it once and
+# never overwrite an existing tree. Best-effort: a failure warns and leaves the
+# rest of the install valid, exactly like the assistant wiring.
+seed_methodology_payload() {
+    local src="$INSTALL_ROOT/current/data/methodology/seeds"
+    local dest="$DATA_ROOT/data/methodology/seeds"
+    local tmp
+
+    if [ -d "$dest" ]; then
+        printf 'install-demiurgos: preserving the existing methodology seeds at %s\n' "$dest" >&2
+        return 0
+    fi
+    if [ ! -d "$src" ]; then
+        warn "no methodology seeds in the installed payload ($src); the foundational methods stay unavailable"
+        return 0
+    fi
+
+    # Atomic bootstrap: a partial copy would fail the seed checksum catalog and
+    # silently disable every foundational method.
+    tmp="$dest.tmp.$$"
+    rm -rf "$tmp"
+    if ! mkdir -p "$(dirname "$dest")" \
+        || ! cp -R "$src/." "$tmp/" 2>/dev/null; then
+        rm -rf "$tmp"
+        warn "could not bootstrap the methodology seeds at $dest; the foundational methods stay unavailable"
+        return 0
+    fi
+    # A concurrent installer may have created the tree while we copied: keep
+    # the first copy (bootstrap-once) instead of nesting a temp dir inside it.
+    if [ -e "$dest" ]; then
+        rm -rf "$tmp"
+        printf 'install-demiurgos: preserving the existing methodology seeds at %s\n' "$dest" >&2
+        return 0
+    fi
+    if ! mv "$tmp" "$dest"; then
+        rm -rf "$tmp"
+        warn "could not bootstrap the methodology seeds at $dest; the foundational methods stay unavailable"
+        return 0
+    fi
+    printf 'install-demiurgos: bootstrapped the methodology seeds at %s\n' "$dest" >&2
+    return 0
+}
+
 bootstrap_data_root() {
     local pointed=""
 
@@ -715,6 +764,7 @@ bootstrap_data_root() {
         printf 'install-demiurgos: recorded in %s; change it with --data-root or from the app\n' \
             "$POINTER_FILE" >&2
         seed_env_file
+        seed_methodology_payload
         return 0
     fi
 
@@ -727,6 +777,7 @@ bootstrap_data_root() {
         printf 'install-demiurgos: pass --data-root to record %s for every later start\n' \
             "$DATA_ROOT" >&2
         seed_env_file
+        seed_methodology_payload
         return 0
     fi
 
@@ -736,6 +787,7 @@ bootstrap_data_root() {
         if [ -n "$pointed" ]; then
             DATA_ROOT="$pointed"
             printf 'install-demiurgos: preserving existing data-root pointer -> %s\n' "$DATA_ROOT" >&2
+            seed_methodology_payload
             return 0
         fi
         fail "data-root pointer $POINTER_FILE is unreadable; refusing to guess"
@@ -748,6 +800,21 @@ bootstrap_data_root() {
     printf 'install-demiurgos: the author content lives in %s\n' "$DATA_ROOT" >&2
     printf 'install-demiurgos: change it with --data-root or from the app\n' >&2
     seed_env_file
+    seed_methodology_payload
+}
+
+# The same-version re-run is a repair path with a documented contract: it exits
+# 0 ("nothing to do"). Never guess a root from a corrupt pointer, never create
+# one the user did not choose, and never let a repair failure abort the re-run.
+repair_data_root_best_effort() {
+    local pointed
+    pointed="$(read_pointer_value 2>/dev/null || true)"
+    if [ -z "$pointed" ]; then
+        pointed="${DEMIURGOS_DATA_ROOT:-}"
+    fi
+    [ -n "$pointed" ] || return 0
+    DATA_ROOT="$pointed"
+    seed_methodology_payload
 }
 
 # --- seed-only entry point (S0-A; test/ops seam) -----------------------------
@@ -809,9 +876,13 @@ from pathlib import Path
 # Registers mcp_servers.demiurgos-graph -> mcp_launcher.py, which resolves the
 # data root and the world at runtime. Never a hardcoded --mundos-path.
 sys.path.insert(0, sys.argv[1])
-from hermes_profile_config import merge_graph_mcp_server
+from hermes_profile_config import merge_graph_mcp_server, remove_engram_mcp_server
 
-merge_graph_mcp_server(Path(sys.argv[2]))
+config = Path(sys.argv[2])
+merge_graph_mcp_server(config)
+# The product keeps its own assistant memory; drop the legacy Engram server
+# from profiles written by older installers (idempotent, preserves siblings).
+remove_engram_mcp_server(config)
 PY
     then
         printf 'install-demiurgos: assistant graph wired at %s\n' "$config" >&2
@@ -840,6 +911,11 @@ if [ -L "$INSTALL_ROOT/current" ] && [ "$(readlink "$INSTALL_ROOT/current")" = "
     mkdir -p "$STAGING_ROOT"
     provision_hermes_runtime
     provision_graph_mcp
+    # Repair the data root too: a user whose seed folder was deleted (or an
+    # install that predates the seed bootstrap) gets the foundational seeds
+    # back. Best-effort: the re-run's documented contract stays "nothing to
+    # do" / exit 0, even with a corrupt pointer or an unwritable home.
+    repair_data_root_best_effort
     if [ "${DEMIURGOS_RESTART_AFTER_INSTALL:-0}" = "1" ]; then
         restart_after_install
     fi
