@@ -1,36 +1,36 @@
 {
-  "version": "0.14.0-beta.2",
+  "version": "0.14.0-beta.3",
   "artifacts": {
     "linux-aarch64": {
-      "artifact": "demiurgos-app-0.14.0-beta.2-linux-aarch64.tar.gz",
+      "artifact": "demiurgos-app-0.14.0-beta.3-linux-aarch64.tar.gz",
       "format": "tar.gz",
-      "sha256": "d76b34fcb711c4216f893008c4a7d7a75ccf9f2909c1ebc94832a28c6bbb77c7"
+      "sha256": "92555217f9685e12162957e7decee9fe7e0f2026b073820f7ae602168889cc89"
     },
     "linux-x86_64": {
-      "artifact": "demiurgos-app-0.14.0-beta.2-linux-x86_64.tar.gz",
+      "artifact": "demiurgos-app-0.14.0-beta.3-linux-x86_64.tar.gz",
       "format": "tar.gz",
-      "sha256": "e86081429ce2e2ba7ddf97f67598514056f9b22418b975c22a4281779ec9b5f6"
+      "sha256": "55a66728befee1170bd7d64d7bcb16e37f8928293f3b5610a7178fdcbc56ca8d"
     },
     "macos-arm64": {
-      "artifact": "demiurgos-app-0.14.0-beta.2-macos-arm64.tar.gz",
+      "artifact": "demiurgos-app-0.14.0-beta.3-macos-arm64.tar.gz",
       "format": "tar.gz",
-      "sha256": "f6ef20a09eec817e6d451b182c737d531139f67a7364628077b7e21c003bab56"
+      "sha256": "dda4396e74a652c755fc446b560864785ef9b4cbadbf248fb7636cf2d5200f97"
     },
     "windows-amd64": {
       "format": "zip",
-      "artifact": "demiurgos-app-0.14.0-beta.2-windows-amd64.zip",
-      "sha256": "bf67ab44f6956db6ada8f8491f8a71871b0fae8ad6ee273908449d99ddebae92"
+      "artifact": "demiurgos-app-0.14.0-beta.3-windows-amd64.zip",
+      "sha256": "585dc55324a2a1f21771f6fcd4943efdfe9d7d5cefe610e23bead6adcb595d45"
     }
   },
   "floors": {
+    "macos": ">= 13 arm64 (Apple Silicon)",
     "linux": "glibc >= 2.28 (x86_64 / aarch64)",
-    "windows": "10/11 x86_64",
-    "macos": ">= 13 arm64 (Apple Silicon)"
+    "windows": "10/11 x86_64"
   },
-  "posix": "demiurgos-app-0.14.0-beta.2-linux-x86_64.tar.gz",
-  "windows": "demiurgos-app-0.14.0-beta.2-windows-amd64.zip",
+  "posix": "demiurgos-app-0.14.0-beta.3-linux-x86_64.tar.gz",
+  "windows": "demiurgos-app-0.14.0-beta.3-windows-amd64.zip",
   "sha256": {
-    "posix": "e86081429ce2e2ba7ddf97f67598514056f9b22418b975c22a4281779ec9b5f6",
-    "windows": "bf67ab44f6956db6ada8f8491f8a71871b0fae8ad6ee273908449d99ddebae92"
+    "posix": "55a66728befee1170bd7d64d7bcb16e37f8928293f3b5610a7178fdcbc56ca8d",
+    "windows": "585dc55324a2a1f21771f6fcd4943efdfe9d7d5cefe610e23bead6adcb595d45"
   }
 }
